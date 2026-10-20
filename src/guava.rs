@@ -18,11 +18,12 @@
 //! ```
 
 use std::borrow::Borrow;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 
 use crate::builder::CacheBuilder;
-use crate::cache::{Cache, Policy};
+use crate::cache::{Cache, CacheMap, Policy};
 use crate::expiry::Expiry;
 use crate::removal::RemovalCause;
 use crate::stats::CacheStats;
@@ -51,6 +52,11 @@ where
         GuavaCacheBuilder {
             inner: Cache::builder(),
         }
+    }
+
+    /// Wraps an existing cache, mirroring Caffeine's Guava adapters.
+    pub fn from_cache(cache: Cache<K, V>) -> Self {
+        Self { inner: cache }
     }
 
     /// Returns the wrapped cache.
@@ -134,14 +140,103 @@ where
         self.inner.stats()
     }
 
-    /// Snapshot of the cache as a map.
-    pub fn as_map(&self) -> std::collections::HashMap<K, V> {
-        self.inner.iter().collect()
+    /// Live map view of the cache, mirroring Guava's `asMap`.
+    pub fn as_map(&self) -> CacheMap<'_, K, V> {
+        self.inner.as_map()
     }
 
     /// Returns the wrapped cache's policy view.
     pub fn policy(&self) -> Policy<'_, K, V> {
         self.inner.policy()
+    }
+}
+
+impl<K, V> From<Cache<K, V>> for GuavaCache<K, V> {
+    fn from(cache: Cache<K, V>) -> Self {
+        Self { inner: cache }
+    }
+}
+
+impl<K, V> From<GuavaCache<K, V>> for Cache<K, V> {
+    fn from(cache: GuavaCache<K, V>) -> Self {
+        cache.inner
+    }
+}
+
+/// A Guava-shaped loading cache whose `get` uses the configured loader.
+pub struct GuavaLoadingCache<K, V> {
+    inner: Cache<K, V>,
+}
+
+impl<K, V> Clone for GuavaLoadingCache<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<K, V> GuavaLoadingCache<K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Guava's `LoadingCache.get`, loading on a miss.
+    pub fn get(&self, key: K) -> Option<V> {
+        self.inner.get_loaded(key)
+    }
+
+    /// Guava's `LoadingCache.getAll`.
+    pub fn get_all(&self, keys: impl IntoIterator<Item = K>) -> HashMap<K, V> {
+        self.inner.get_all_loaded(keys)
+    }
+
+    /// Returns a cached value without loading.
+    pub fn get_if_present<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.get(key)
+    }
+
+    /// Guava's `invalidate`.
+    pub fn invalidate<Q>(&self, key: &Q)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.inner.invalidate(key);
+    }
+
+    /// Guava's `invalidateAll`.
+    pub fn invalidate_all(&self) {
+        self.inner.invalidate_all();
+    }
+
+    /// Guava's `size`.
+    pub fn size(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Guava's `stats`.
+    pub fn stats(&self) -> CacheStats {
+        self.inner.stats()
+    }
+
+    /// Live map view of the cache.
+    pub fn as_map(&self) -> CacheMap<'_, K, V> {
+        self.inner.as_map()
+    }
+
+    /// Returns a policy view.
+    pub fn policy(&self) -> Policy<'_, K, V> {
+        self.inner.policy()
+    }
+
+    /// Returns the wrapped cache.
+    pub fn into_inner(self) -> Cache<K, V> {
+        self.inner
     }
 }
 
@@ -253,6 +348,17 @@ where
         F: Fn(&K) -> Option<V> + Send + Sync + 'static,
     {
         GuavaCache {
+            inner: self.inner.build_with_loader(loader),
+        }
+    }
+
+    /// Guava's `build(CacheLoader)`, returning a loading cache whose `get`
+    /// loads missing values.
+    pub fn build_loading_cache<F>(self, loader: F) -> GuavaLoadingCache<K, V>
+    where
+        F: Fn(&K) -> Option<V> + Send + Sync + 'static,
+    {
+        GuavaLoadingCache {
             inner: self.inner.build_with_loader(loader),
         }
     }

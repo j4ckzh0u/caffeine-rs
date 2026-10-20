@@ -8,7 +8,9 @@ use std::time::Duration;
 use caffeine::guava::GuavaCache;
 use caffeine::jcache::{CachingProvider, Configuration};
 use caffeine::simulator::{simulate, Policy as SimulatorPolicy};
-use caffeine::{AsyncCache, AsyncLoadingCache, Cache, ExpiryCreating, ReferenceCache, Ticker};
+use caffeine::{
+    AsyncCache, AsyncLoadingCache, Cache, CacheStats, ExpiryCreating, ReferenceCache, Ticker,
+};
 
 struct FakeTicker(Arc<AtomicU64>);
 
@@ -297,4 +299,144 @@ fn jcache_facade_tracks_configuration_and_names() {
     assert!(jcache.is_closed());
     manager.destroy_cache("numbers");
     assert!(manager.cache_names().is_empty());
+}
+
+#[test]
+fn loading_cache_get_uses_the_configured_loader() {
+    let loads = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&loads);
+    let cache: Cache<u64, u64> =
+        Cache::builder()
+            .maximum_size(10)
+            .build_with_loader(move |key: &u64| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Some(key * 10)
+            });
+
+    assert_eq!(cache.get_loaded(3), Some(30));
+    assert_eq!(cache.get_loaded(3), Some(30));
+    assert_eq!(loads.load(Ordering::Relaxed), 1);
+    assert_eq!(cache.get_all_loaded([4, 5]).len(), 2);
+    assert_eq!(cache.get_all_present([3, 99]).len(), 1);
+}
+
+#[test]
+fn cache_map_view_writes_through() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(10).build();
+    let map = cache.as_map();
+
+    assert_eq!(map.insert(1, 10), None);
+    assert_eq!(map.insert(1, 11), Some(10));
+    assert_eq!(map.get(&1), Some(11));
+    assert_eq!(map.put_if_absent(1, 99), Some(11));
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.remove(&1), Some(11));
+    assert!(map.is_empty());
+}
+
+#[test]
+fn builder_constructs_async_views() {
+    let async_cache: AsyncCache<u64, u64> = Cache::builder().maximum_size(10).build_async();
+    let value = block_on(async_cache.get_with(1, |key| key + 1));
+    assert_eq!(value, 2);
+
+    let loading = Cache::builder()
+        .maximum_size(10)
+        .build_async_with_loader(|key: u64| async move { key * 2 });
+    let all = block_on(loading.get_all([1, 2, 3]));
+    assert_eq!(all.len(), 3);
+    assert_eq!(block_on(loading.get_if_present(&2)), Some(4));
+}
+
+#[test]
+fn weighted_policy_snapshots_and_stats_arithmetic() {
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_weight(10)
+        .weigher(|_key, value| *value as u32)
+        .build();
+    cache.put(1, 2);
+    cache.put(2, 2);
+
+    let policy = cache.policy();
+    let eviction = policy.eviction().unwrap();
+    let coldest = eviction.coldest_weighted(3);
+    assert_eq!(coldest.len(), 1);
+    let hottest = eviction.hottest_weighted(3);
+    assert_eq!(hottest.len(), 1);
+
+    let stats = cache.stats();
+    let sum = stats.plus(&CacheStats {
+        hit_count: 2,
+        ..CacheStats::default()
+    });
+    assert_eq!(sum.hit_count, 2);
+    assert_eq!(
+        sum.minus(&CacheStats {
+            hit_count: 5,
+            ..CacheStats::default()
+        })
+        .hit_count,
+        0
+    );
+    assert_eq!(sum.eviction_weight(), 0);
+}
+
+#[test]
+fn guava_loading_cache_and_conversions() {
+    let loading = GuavaCache::builder()
+        .maximum_size(10)
+        .build_loading_cache(|key: &u64| Some(key * 3));
+    assert_eq!(loading.get(2), Some(6));
+    assert_eq!(loading.get_all([2, 3]).len(), 2);
+
+    let inner: Cache<u64, u64> = loading.into_inner();
+    let wrapped = GuavaCache::from(inner);
+    assert_eq!(wrapped.get_if_present(&2), Some(6));
+    let inner: Cache<u64, u64> = wrapped.into();
+    assert_eq!(inner.get(&2), Some(6));
+}
+
+#[test]
+fn bulk_get_loads_only_missing_keys() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(10).build();
+    cache.put(1, 10);
+    let mut missing_seen = 0;
+    let values = cache.get_all([1, 2, 3], |missing| {
+        missing_seen = missing.len();
+        missing.iter().map(|key| (*key, key * 10)).collect()
+    });
+    assert_eq!(missing_seen, 2);
+    assert_eq!(values.len(), 3);
+    assert_eq!(values.get(&2), Some(&20));
+    assert_eq!(cache.get(&3), Some(30));
+}
+
+#[test]
+fn policy_entry_snapshot_exposes_metadata() {
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(10)
+        .expire_after_write(Duration::from_secs(30))
+        .build();
+    cache.put(1, 10);
+
+    let policy = cache.policy();
+    let entry = policy.get_entry_if_present_quietly(1).unwrap();
+    assert_eq!(entry.key(), &1);
+    assert_eq!(entry.value(), &10);
+    assert_eq!(entry.weight, 1);
+    assert!(entry.expires_after() <= Duration::from_secs(30));
+    assert_eq!(entry.refreshable_at, u64::MAX);
+    assert!(policy.get_entry_if_present_quietly(2).is_none());
+}
+
+#[test]
+fn async_cache_bulk_get_uses_mapping() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(10).build();
+    cache.put(1, 10);
+    let async_cache = AsyncCache::new(cache);
+    let values = block_on(async_cache.get_all([1, 2], |missing| {
+        missing.iter().map(|key| (*key, key * 20)).collect()
+    }));
+    assert_eq!(values.len(), 2);
+    assert_eq!(values.get(&2), Some(&40));
 }

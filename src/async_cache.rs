@@ -19,7 +19,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, ThreadId};
 use std::time::Instant;
 
-use crate::cache::{Cache, Policy};
+use crate::cache::{Cache, CacheMap, Policy};
 use crate::stats::CacheStats;
 
 /// A future returned by [`AsyncLoadingCache::get`].
@@ -66,6 +66,81 @@ where
     /// Returns a clone of the cached value without loading.
     pub async fn get(&self, key: K) -> Option<V> {
         self.cache.get(&key)
+    }
+
+    /// Returns a live map view over the synchronous cache.
+    pub fn as_map(&self) -> CacheMap<'_, K, V> {
+        self.cache.as_map()
+    }
+
+    /// Inserts every entry from `entries`.
+    pub fn put_all(&self, entries: impl IntoIterator<Item = (K, V)>) {
+        for (key, value) in entries {
+            self.cache.insert(key, value);
+        }
+    }
+
+    /// Returns the entries for `keys`, invoking `mapping` once for the
+    /// missing keys. Every returned entry is stored, but only requested keys
+    /// appear in the result.
+    pub async fn get_all<F>(&self, keys: impl IntoIterator<Item = K>, mapping: F) -> HashMap<K, V>
+    where
+        F: FnOnce(&[K]) -> HashMap<K, V>,
+    {
+        let mut result = HashMap::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            match self.cache.get(&key) {
+                Some(value) => {
+                    result.insert(key, value);
+                }
+                None => missing.push(key),
+            }
+        }
+        if missing.is_empty() {
+            return result;
+        }
+        for (key, value) in mapping(&missing) {
+            let requested = missing.contains(&key);
+            self.cache.insert(key.clone(), value.clone());
+            if requested {
+                result.insert(key, value);
+            }
+        }
+        result
+    }
+
+    /// Like [`get_all`](Self::get_all), but `mapping` is asynchronous.
+    pub async fn get_all_async<F, Fut>(
+        &self,
+        keys: impl IntoIterator<Item = K>,
+        mapping: F,
+    ) -> HashMap<K, V>
+    where
+        F: FnOnce(&[K]) -> Fut,
+        Fut: Future<Output = HashMap<K, V>>,
+    {
+        let mut result = HashMap::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            match self.cache.get(&key) {
+                Some(value) => {
+                    result.insert(key, value);
+                }
+                None => missing.push(key),
+            }
+        }
+        if missing.is_empty() {
+            return result;
+        }
+        for (key, value) in mapping(&missing).await {
+            let requested = missing.contains(&key);
+            self.cache.insert(key.clone(), value.clone());
+            if requested {
+                result.insert(key, value);
+            }
+        }
+        result
     }
 
     /// Returns the value, computing it with `init` on a miss.
@@ -281,6 +356,86 @@ where
     pub async fn get(&self, key: K) -> V {
         let loader = Arc::clone(&self.loader);
         self.cache.get_with_async(key, move |key| loader(key)).await
+    }
+
+    /// Returns every requested key, loading missing values one at a time.
+    ///
+    /// Caffeine loads missing keys concurrently with `CompletableFuture`;
+    /// without an async runtime dependency this method awaits them in order,
+    /// producing the same result.
+    pub async fn get_all(&self, keys: impl IntoIterator<Item = K>) -> HashMap<K, V> {
+        let mut result = HashMap::new();
+        for key in keys {
+            let value = self.get(key.clone()).await;
+            result.insert(key, value);
+        }
+        result
+    }
+
+    /// Returns the cached value without loading.
+    pub async fn get_if_present<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.synchronous().get(key)
+    }
+
+    /// Inserts a value immediately.
+    pub fn put(&self, key: K, value: V) {
+        self.cache.put(key, value);
+    }
+
+    /// Inserts every entry.
+    pub fn put_all(&self, entries: impl IntoIterator<Item = (K, V)>) {
+        self.cache.put_all(entries);
+    }
+
+    /// Inserts the value produced by a future.
+    pub async fn put_future<F>(&self, key: K, value: F)
+    where
+        F: Future<Output = V>,
+    {
+        self.cache.put_future(key, value).await;
+    }
+
+    /// Removes an entry.
+    pub fn invalidate<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.synchronous().invalidate(key)
+    }
+
+    /// Removes every entry.
+    pub fn invalidate_all(&self) {
+        self.cache.synchronous().invalidate_all();
+    }
+
+    /// Performs expiration maintenance.
+    pub fn clean_up(&self) {
+        self.cache.synchronous().clean_up();
+    }
+
+    /// Approximate number of entries.
+    pub fn estimated_size(&self) -> usize {
+        self.cache.synchronous().estimated_size()
+    }
+
+    /// Statistics snapshot.
+    pub fn stats(&self) -> CacheStats {
+        self.cache.synchronous().stats()
+    }
+
+    /// Returns a policy view for the underlying cache.
+    pub fn policy(&self) -> Policy<'_, K, V> {
+        self.cache.synchronous().policy()
+    }
+
+    /// Returns a live map view over the synchronous cache.
+    pub fn as_map(&self) -> CacheMap<'_, K, V> {
+        self.cache.synchronous().as_map()
     }
 
     /// Returns the underlying asynchronous cache.

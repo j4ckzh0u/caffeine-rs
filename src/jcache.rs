@@ -199,6 +199,19 @@ where
         self.inner.invalidate(key)
     }
 
+    /// JSR-107 `loadAll`, loading missing keys with the cache's configured
+    /// loader.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the underlying cache has no loader.
+    pub fn load_all(&self, keys: impl IntoIterator<Item = K>) {
+        self.check_open();
+        for key in keys {
+            self.inner.get_loaded(key);
+        }
+    }
+
     /// Removes the listed entries.
     pub fn remove_all<Q>(&self, keys: &[&Q])
     where

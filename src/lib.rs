@@ -27,6 +27,8 @@
 //! - Size-based eviction with W-TinyLFU (`maximum_size`)
 //! - Weight-based eviction with a custom weigher (`maximum_weight` + `weigher`)
 //! - Expiration after write, after access, both at once, or per entry via [`Expiry`]
+//! - Automatic loading (`get_loaded`, `get_all_loaded`) and a live map view
+//!   (`as_map`)
 //! - Adaptive admission window: reactive hill climbing up to 4096 entries,
 //!   density feedback with probes and audits above it
 //! - Asynchronous refresh after write, with one in-flight refresh per key
@@ -77,7 +79,9 @@ pub mod simulator;
 
 pub use async_cache::{AsyncCache, AsyncLoadingCache, BoxFuture};
 pub use builder::CacheBuilder;
-pub use cache::{Cache, Eviction, FixedExpiration, FixedRefresh, Policy, VarExpiration};
+pub use cache::{
+    Cache, CacheEntry, CacheMap, Eviction, FixedExpiration, FixedRefresh, Policy, VarExpiration,
+};
 pub use expiry::{
     Expiry, ExpiryAccessing, ExpiryAfterAccess, ExpiryAfterWrite, ExpiryCreating, ExpiryWriting,
 };

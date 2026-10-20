@@ -48,16 +48,17 @@ cargo run --example basic
 | Hill-climbing adaptive window | ✅ | reactive tier up to 4096 entries |
 | Density-tier window heuristics | ✅ | probes, audits, anchors above 4096 entries |
 | Refresh after write | ✅ | async, one in-flight refresh per key |
-| Automatic loading | ✅ | `get_with` / `try_get_with` / `build_with_loader` |
+| Automatic loading | ✅ | `get_loaded` / `get_all_loaded` / `get_with` / `try_get_with` |
 | Removal listener | ✅ | synchronous, gets the `RemovalCause` |
 | Eviction listener | ✅ | size/weight, expiration, and collected removals |
-| Statistics | ✅ | hits, misses, loads, load time, evictions |
-| Policy inspection and resizing | ✅ | eviction, expiration, and refresh views |
+| Statistics | ✅ | hits, misses, loads, load time, evictions, `plus`/`minus` |
+| Policy inspection and resizing | ✅ | eviction, expiration, and refresh views; weighted coldest/hottest |
+| Map view | ✅ | live `as_map()` with read/write operations |
 | Custom ticker | ✅ | deterministic time in tests |
 | Custom executor | ✅ | drives refresh tasks |
 | Weak / soft references | ✅ | `ReferenceCache`: weak/soft values, identity weak keys |
-| Async cache views | ✅ | `AsyncCache` / `AsyncLoadingCache` async methods |
-| Guava adapter | ✅ | `guava` module: Guava-shaped builder and cache |
+| Async cache views | ✅ | `AsyncCache` / `AsyncLoadingCache`, builder constructors |
+| Guava adapter | ✅ | `guava` module: builder, cache, loading cache, conversions |
 | JCache adapter | ✅ | `jcache` module: JSR-107-shaped provider, manager, cache |
 | Simulator | ✅ | trace replay for W-TinyLFU, LRU, and LFU |
 
@@ -84,6 +85,18 @@ assert_eq!(value, 80);
 
 let result: Result<u64, &str> = cache.try_get_with(9, |_| Err("backend down"));
 assert!(result.is_err());
+```
+
+A cache built with `build_with_loader` exposes `get_loaded` and
+`get_all_loaded`, matching `LoadingCache.get` / `getAll`:
+
+```rust
+let cache: caffeine::Cache<u64, u64> = caffeine::Cache::builder()
+    .maximum_size(1_000)
+    .build_with_loader(|key| Some(key * 10));
+
+assert_eq!(cache.get_loaded(3), Some(30));
+assert_eq!(cache.get_all_loaded([4, 5]).len(), 2);
 ```
 
 `get_with` coalesces concurrent misses on the same key: one thread runs the
@@ -271,7 +284,19 @@ assert_eq!(value, 84);
 Concurrent misses for one key are coalesced: the first caller runs the
 initializer and the others await its result. Cancellation, failure, or a panic
 wakes the waiters and lets one of them retry; a failed load is never shared.
-`AsyncLoadingCache::new(cache, loader)` installs a boxed async loader.
+`AsyncLoadingCache::new(cache, loader)` installs a boxed async loader, and the
+builder forms mirror Caffeine:
+
+```rust
+let async_cache: caffeine::AsyncCache<u64, u64> =
+    caffeine::Cache::builder().maximum_size(1_000).build_async();
+let loading = caffeine::Cache::builder()
+    .maximum_size(1_000)
+    .build_async_with_loader(|key: u64| async move { key * 2 });
+```
+
+`AsyncLoadingCache::get_all` loads every requested key; `AsyncCache::put_all`
+and `as_map` complete the map-shaped surface.
 
 ### Policy inspection
 
@@ -289,6 +314,8 @@ let eviction = cache.policy().eviction().unwrap();
 eviction.set_maximum(500);          // eagerly evicts the excess
 let coldest = eviction.coldest(10);
 let hottest = eviction.hottest(10);
+let coldest_by_weight = eviction.coldest_weighted(100);
+let hottest_by_weight = eviction.hottest_weighted(100);
 
 let expiration = cache.policy().expire_after_access().unwrap();
 expiration.set_expires_after(Duration::from_secs(60));
@@ -313,10 +340,11 @@ println!("hit rate {:.2}", stats.hit_rate());
 
 ### Guava and JCache adapters
 
-The `guava` module provides a Guava-shaped builder and cache, and the `jcache`
-module provides a JSR-107-shaped provider, manager, configuration, and cache.
-They are Rust API-shape adapters over this crate, not binary-compatible with
-the Java libraries.
+The `guava` module provides a Guava-shaped builder, cache, and loading cache,
+and the `jcache` module provides a JSR-107-shaped provider, manager,
+configuration, and cache. `GuavaCache::from(cache)` and `Into<Cache>` convert
+between the adapter and the native cache. They are Rust API-shape adapters over
+this crate, not binary-compatible with the Java libraries.
 
 ## Equivalence with Java Caffeine
 

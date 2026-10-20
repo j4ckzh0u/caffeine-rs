@@ -84,4 +84,39 @@ impl CacheStats {
         let nanos = self.total_load_time.as_nanos() as u64;
         Duration::from_nanos(nanos.checked_div(self.load_success_count).unwrap_or(0))
     }
+
+    /// Total weight of evicted entries, mirroring `CacheStats.evictionWeight`.
+    pub fn eviction_weight(&self) -> u64 {
+        self.evicted_weight
+    }
+
+    /// Returns the sum of this snapshot and `other`.
+    pub fn plus(&self, other: &CacheStats) -> CacheStats {
+        CacheStats {
+            hit_count: self.hit_count + other.hit_count,
+            miss_count: self.miss_count + other.miss_count,
+            load_success_count: self.load_success_count + other.load_success_count,
+            load_failure_count: self.load_failure_count + other.load_failure_count,
+            total_load_time: self.total_load_time + other.total_load_time,
+            eviction_count: self.eviction_count + other.eviction_count,
+            evicted_weight: self.evicted_weight + other.evicted_weight,
+        }
+    }
+
+    /// Returns this snapshot minus `other`, saturating at zero.
+    pub fn minus(&self, other: &CacheStats) -> CacheStats {
+        CacheStats {
+            hit_count: self.hit_count.saturating_sub(other.hit_count),
+            miss_count: self.miss_count.saturating_sub(other.miss_count),
+            load_success_count: self
+                .load_success_count
+                .saturating_sub(other.load_success_count),
+            load_failure_count: self
+                .load_failure_count
+                .saturating_sub(other.load_failure_count),
+            total_load_time: self.total_load_time.saturating_sub(other.total_load_time),
+            eviction_count: self.eviction_count.saturating_sub(other.eviction_count),
+            evicted_weight: self.evicted_weight.saturating_sub(other.evicted_weight),
+        }
+    }
 }

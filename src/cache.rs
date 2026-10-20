@@ -145,6 +145,52 @@ where
         }
     }
 
+    /// Returns the live entries for `keys`, recording hits and misses.
+    ///
+    /// This mirrors `Cache.getAllPresent`: absent keys are simply omitted
+    /// from the result.
+    pub fn get_all_present(&self, keys: impl IntoIterator<Item = K>) -> HashMap<K, V> {
+        keys.into_iter()
+            .filter_map(|key| self.get(&key).map(|value| (key, value)))
+            .collect()
+    }
+
+    /// Returns the entries for `keys`, invoking `mapping` once for the keys
+    /// that were missing.
+    ///
+    /// Every entry returned by `mapping` is stored, but only requested keys
+    /// appear in the result. This mirrors `Cache.getAll`.
+    pub fn get_all<F>(&self, keys: impl IntoIterator<Item = K>, mapping: F) -> HashMap<K, V>
+    where
+        F: FnOnce(&[K]) -> HashMap<K, V>,
+    {
+        let mut result = HashMap::new();
+        let mut missing = Vec::new();
+        for key in keys {
+            match self.get(&key) {
+                Some(value) => {
+                    result.insert(key, value);
+                }
+                None => missing.push(key),
+            }
+        }
+        if missing.is_empty() {
+            return result;
+        }
+
+        let started = Instant::now();
+        let loaded = mapping(&missing);
+        for (key, value) in loaded {
+            let requested = missing.contains(&key);
+            self.insert(key.clone(), value.clone());
+            self.record_load_success(started);
+            if requested {
+                result.insert(key, value);
+            }
+        }
+        result
+    }
+
     /// Returns the value for `key` without recording statistics, updating
     /// recency, or extending an access-based TTL.
     pub fn peek<Q>(&self, key: &Q) -> Option<V>
@@ -185,8 +231,10 @@ where
 
     /// Returns the cached value, loading and inserting it on a miss.
     ///
-    /// Concurrent misses for the same key may each run `init`; the last
-    /// insertion wins. Use a single-flight helper if that is not acceptable.
+    /// Concurrent misses for the same key are coalesced: one caller runs
+    /// `init` while the others wait and reuse the cached value. If the loader
+    /// panics, the waiters wake and retry. Recursively loading the same key
+    /// from inside its initializer panics.
     pub fn get_with<F>(&self, key: K, init: F) -> V
     where
         F: FnOnce(&K) -> V,
@@ -267,6 +315,62 @@ where
         }
     }
 
+    /// Loads the value for `key` with the loader configured by
+    /// [`build_with_loader`](crate::CacheBuilder::build_with_loader).
+    ///
+    /// This mirrors `LoadingCache.get`. A loader returning `None` leaves the
+    /// key absent. Concurrent misses for the same key are coalesced.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no loader was configured. Use [`get`](Self::get) for caches
+    /// without a loader.
+    pub fn get_loaded(&self, key: K) -> Option<V> {
+        let loader = self
+            .inner
+            .config
+            .loader
+            .clone()
+            .expect("get_loaded requires a loader; build with build_with_loader");
+        if let Some(value) = self.get(&key) {
+            return Some(value);
+        }
+        loop {
+            match self.begin_load(&key) {
+                Some(slot) => {
+                    self.wait_for_load(&slot);
+                    if let Some(value) = self.peek(&key) {
+                        return Some(value);
+                    }
+                }
+                None => {
+                    let _guard = LoadGuard {
+                        cache: self,
+                        key: key.clone(),
+                    };
+                    if let Some(value) = self.peek(&key) {
+                        return Some(value);
+                    }
+                    let started = Instant::now();
+                    let value = loader(&key)?;
+                    self.record_load_success(started);
+                    self.insert(key.clone(), value.clone());
+                    return Some(value);
+                }
+            }
+        }
+    }
+
+    /// Loads every missing key with the configured loader.
+    ///
+    /// This mirrors `LoadingCache.getAll`; the returned map contains only the
+    /// keys that resolved to a value.
+    pub fn get_all_loaded(&self, keys: impl IntoIterator<Item = K>) -> HashMap<K, V> {
+        keys.into_iter()
+            .filter_map(|key| self.get_loaded(key.clone()).map(|value| (key, value)))
+            .collect()
+    }
+
     // ------------------------------------------------------------------
     // Load coalescing
     // ------------------------------------------------------------------
@@ -312,6 +416,23 @@ where
 
     /// Inserts or replaces an entry, notifying listeners for a replaced value.
     pub fn insert(&self, key: K, value: V) {
+        let removed = self.insert_entry(key, value);
+        self.notify(removed);
+    }
+
+    /// Inserts or replaces an entry and returns the previous value, matching
+    /// `ConcurrentMap.put`.
+    pub fn put_returning(&self, key: K, value: V) -> Option<V> {
+        let removed = self.insert_entry(key, value);
+        let previous = removed
+            .iter()
+            .find(|entry| entry.cause == RemovalCause::Replaced)
+            .map(|entry| entry.value.clone());
+        self.notify(removed);
+        previous
+    }
+
+    fn insert_entry(&self, key: K, value: V) -> Vec<RemovedEntry<K, V>> {
         let now = self.now();
         let hash = self.hash_key(&key);
         let weight = self.inner.config.weight(&key, &value);
@@ -321,12 +442,19 @@ where
             let mut shard = lock(&self.inner.shards[shard_index]);
             shard.insert(key, value, hash, weight, now, &mut removed);
         }
-        self.notify(removed);
+        removed
     }
 
     /// Alias for [`insert`](Self::insert), matching `ConcurrentMap::put`.
     pub fn put(&self, key: K, value: V) {
         self.insert(key, value);
+    }
+
+    /// Inserts every entry, mirroring `Cache.putAll`.
+    pub fn put_all(&self, entries: impl IntoIterator<Item = (K, V)>) {
+        for (key, value) in entries {
+            self.insert(key, value);
+        }
     }
 
     /// Inserts only when the key is absent, returning the existing value
@@ -349,6 +477,16 @@ where
         };
         self.notify(removed);
         previous
+    }
+
+    /// Returns a live, map-shaped view over this cache, mirroring
+    /// `Cache.asMap`.
+    ///
+    /// Reads and writes go through the cache itself. Iteration returns a
+    /// snapshot, because holding the shard lock across a user loop is not
+    /// possible in safe Rust.
+    pub fn as_map(&self) -> CacheMap<'_, K, V> {
+        CacheMap { cache: self }
     }
 
     /// Removes an entry, returning its value if it was present.
@@ -393,6 +531,17 @@ where
             removed.append(&mut lock(shard).drain());
         }
         self.notify(removed);
+    }
+
+    /// Removes every supplied key, mirroring `Cache.invalidateAll(Iterable)`.
+    pub fn invalidate_keys<Q>(&self, keys: impl IntoIterator<Item = Q>)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        for key in keys {
+            self.invalidate(&key);
+        }
     }
 
     /// Alias for [`invalidate_all`](Self::invalidate_all).
@@ -651,6 +800,13 @@ where
         }
     }
 
+    /// Refreshes every supplied key, mirroring `LoadingCache.refreshAll`.
+    pub fn refresh_all(&self, keys: impl IntoIterator<Item = K>) {
+        for key in keys {
+            self.refresh(&key);
+        }
+    }
+
     // ------------------------------------------------------------------
     // Internals
     // ------------------------------------------------------------------
@@ -774,6 +930,45 @@ where
     }
 }
 
+/// A snapshot of a cache entry, mirroring Caffeine's `Policy.CacheEntry`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CacheEntry<K, V> {
+    /// The entry's key.
+    pub key: K,
+    /// The entry's value.
+    pub value: V,
+    /// The entry's weight.
+    pub weight: u32,
+    /// Absolute ticker reading at which the entry expires.
+    pub expires_at: u64,
+    /// Absolute ticker reading at which the entry becomes refreshable.
+    pub refreshable_at: u64,
+    /// Ticker reading when the snapshot was taken.
+    pub snapshot_at: u64,
+}
+
+impl<K, V> CacheEntry<K, V> {
+    /// The entry's key.
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// The entry's value.
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    /// Duration until the entry expires.
+    pub fn expires_after(&self) -> Duration {
+        Duration::from_nanos(self.expires_at.saturating_sub(self.snapshot_at))
+    }
+
+    /// Duration until the entry becomes refreshable.
+    pub fn refreshable_after(&self) -> Duration {
+        Duration::from_nanos(self.refreshable_at.saturating_sub(self.snapshot_at))
+    }
+}
+
 /// A read-only view of the cache's eviction and expiration configuration,
 /// mirroring Caffeine's `Policy`.
 pub struct Policy<'a, K, V> {
@@ -865,6 +1060,24 @@ where
         self.cache.peek(key)
     }
 
+    /// Returns an entry snapshot without recording a hit or miss, mirroring
+    /// `Policy.getEntryIfPresentQuietly`.
+    pub fn get_entry_if_present_quietly(&self, key: K) -> Option<CacheEntry<K, V>> {
+        let value = self.cache.peek(&key)?;
+        let snapshot_at = self.cache.now();
+        let weight = self.cache.weight_of(&key).unwrap_or(1);
+        let expires_at = self.cache.expires_at(&key).unwrap_or(u64::MAX);
+        let refreshable_at = self.cache.refreshable_at(&key).unwrap_or(u64::MAX);
+        Some(CacheEntry {
+            key,
+            value,
+            weight,
+            expires_at,
+            refreshable_at,
+            snapshot_at,
+        })
+    }
+
     /// Clones every live key.
     pub fn keys(&self) -> Vec<K> {
         self.cache.keys()
@@ -937,6 +1150,41 @@ where
     /// Snapshot from most to least likely to be retained.
     pub fn hottest(&self, limit: usize) -> Vec<(K, V)> {
         self.cache.hottest(limit)
+    }
+
+    /// Snapshot from least to most likely to be retained, bounded by total
+    /// weight rather than entry count.
+    pub fn coldest_weighted(&self, weight_limit: u64) -> Vec<(K, V)> {
+        self.weighted_snapshot(false, weight_limit)
+    }
+
+    /// Snapshot from most to least likely to be retained, bounded by total
+    /// weight rather than entry count.
+    pub fn hottest_weighted(&self, weight_limit: u64) -> Vec<(K, V)> {
+        self.weighted_snapshot(true, weight_limit)
+    }
+
+    fn weighted_snapshot(&self, hottest: bool, weight_limit: u64) -> Vec<(K, V)> {
+        let entries = if hottest {
+            self.cache.hottest(usize::MAX)
+        } else {
+            self.cache.coldest(usize::MAX)
+        };
+        let mut total = 0u64;
+        let mut selected = Vec::new();
+        for (key, value) in entries {
+            let weight = if self.is_weighted() {
+                self.cache.weight_of(&key).unwrap_or(1) as u64
+            } else {
+                1
+            };
+            if total.saturating_add(weight) > weight_limit {
+                break;
+            }
+            total += weight;
+            selected.push((key, value));
+        }
+        selected
     }
 }
 
@@ -1088,6 +1336,95 @@ where
     /// Entries written most recently.
     pub fn youngest(&self, limit: usize) -> Vec<(K, V)> {
         self.cache.order_by_time(false, false, limit)
+    }
+}
+
+/// A live, map-shaped view of a [`Cache`], returned by [`Cache::as_map`].
+///
+/// Mutations and reads are forwarded to the cache. Iteration returns a
+/// snapshot of the entries.
+pub struct CacheMap<'a, K, V> {
+    cache: &'a Cache<K, V>,
+}
+
+impl<K, V> CacheMap<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Returns a clone of the cached value.
+    pub fn get<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.get(key)
+    }
+
+    /// Returns `true` when a live entry exists.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.contains_key(key)
+    }
+
+    /// Inserts or replaces an entry, returning the previous value.
+    pub fn insert(&self, key: K, value: V) -> Option<V> {
+        self.cache.put_returning(key, value)
+    }
+
+    /// Inserts only when absent, returning the existing value otherwise.
+    pub fn put_if_absent(&self, key: K, value: V) -> Option<V> {
+        self.cache.put_if_absent(key, value)
+    }
+
+    /// Removes an entry, returning its value if it was present.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.invalidate(key)
+    }
+
+    /// Number of held entries.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    /// Returns `true` when the cache holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    /// Removes every entry.
+    pub fn clear(&self) {
+        self.cache.invalidate_all();
+    }
+
+    /// Retains only entries matching the predicate.
+    pub fn retain<F>(&self, predicate: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.cache.retain(predicate);
+    }
+
+    /// Snapshot of every entry.
+    pub fn iter(&self) -> std::vec::IntoIter<(K, V)> {
+        self.cache.iter()
+    }
+
+    /// Snapshot of every key.
+    pub fn keys(&self) -> Vec<K> {
+        self.cache.keys()
+    }
+
+    /// Snapshot of every value.
+    pub fn values(&self) -> Vec<V> {
+        self.cache.iter().map(|(_, value)| value).collect()
     }
 }
 

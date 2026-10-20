@@ -1,10 +1,12 @@
 //! Fluent cache construction, mirroring Caffeine's `Caffeine` builder.
 
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::async_cache::{AsyncCache, AsyncLoadingCache};
 use crate::cache::Cache;
 use crate::config::{default_executor, Config, Executor, Loader, Weigher};
 use crate::expiry::{Expiration, Expiry};
@@ -194,6 +196,34 @@ where
     {
         self.loader = Some(Arc::new(loader));
         self.finish()
+    }
+
+    /// Alias for [`build_with_loader`](Self::build_with_loader), mirroring
+    /// Caffeine's `build(CacheLoader)`.
+    pub fn build_loading_cache<F>(self, loader: F) -> Cache<K, V>
+    where
+        F: Fn(&K) -> Option<V> + Send + Sync + 'static,
+    {
+        self.build_with_loader(loader)
+    }
+
+    /// Builds an asynchronous view over the cache, mirroring
+    /// `Caffeine.buildAsync()`.
+    pub fn build_async(self) -> AsyncCache<K, V> {
+        AsyncCache::new(self.build())
+    }
+
+    /// Builds an asynchronous loading cache, mirroring
+    /// `Caffeine.buildAsync(CacheLoader)`.
+    pub fn build_async_with_loader<F, Fut>(self, loader: F) -> AsyncLoadingCache<K, V>
+    where
+        F: Fn(K) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = V> + Send + 'static,
+    {
+        if self.refresh_after_write.is_some() {
+            panic!("refresh_after_write requires build_with_loader, not an async loader");
+        }
+        AsyncLoadingCache::new(self.build(), move |key| Box::pin(loader(key)))
     }
 
     fn finish(self) -> Cache<K, V> {
