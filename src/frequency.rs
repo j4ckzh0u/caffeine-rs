@@ -38,6 +38,11 @@ impl FrequencySketch {
         }
     }
 
+    /// Number of recorded usages between sketch resets.
+    pub(crate) fn sample_size(&self) -> u64 {
+        self.sample_size
+    }
+
     /// Estimates the frequency of `hash`, between 0 and 15.
     pub(crate) fn frequency(&self, hash: u64) -> u8 {
         let mut min = u8::MAX;

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::cache::Cache;
 use crate::config::{default_executor, Config, Executor, Loader, Weigher};
+use crate::expiry::{Expiration, Expiry};
 use crate::removal::{EvictionListener, RemovalCause, RemovalListener};
 use crate::ticker::{nanos, SharedTicker, SystemTicker, Ticker};
 
@@ -17,6 +18,7 @@ use crate::ticker::{nanos, SharedTicker, SystemTicker, Ticker};
 /// - both `maximum_size` and `maximum_weight`
 /// - `maximum_weight` without a `weigher`, or a `weigher` without `maximum_weight`
 /// - both `expire_after_access` and `expire_after_write`
+/// - more than one of `expire_after_write`, `expire_after_access`, and `expire_after`
 /// - `refresh_after_write` without a loader
 pub struct CacheBuilder<K, V> {
     maximum_size: Option<usize>,
@@ -25,6 +27,7 @@ pub struct CacheBuilder<K, V> {
     initial_capacity: usize,
     expire_after_write: Option<Duration>,
     expire_after_access: Option<Duration>,
+    expiry: Option<Arc<dyn Expiry<K, V>>>,
     refresh_after_write: Option<Duration>,
     record_stats: bool,
     ticker: Option<SharedTicker>,
@@ -44,6 +47,7 @@ impl<K, V> CacheBuilder<K, V> {
             initial_capacity: 0,
             expire_after_write: None,
             expire_after_access: None,
+            expiry: None,
             refresh_after_write: None,
             record_stats: false,
             ticker: None,
@@ -83,9 +87,23 @@ impl<K, V> CacheBuilder<K, V> {
 
     /// Expires an entry `duration` after its last read or write.
     ///
-    /// Mutually exclusive with [`expire_after_write`](Self::expire_after_write).
+    /// Mutually exclusive with [`expire_after_write`](Self::expire_after_write)
+    /// and [`expire_after`](Self::expire_after).
     pub fn expire_after_access(mut self, duration: Duration) -> Self {
         self.expire_after_access = Some(duration);
+        self
+    }
+
+    /// Uses a custom per-entry expiration policy.
+    ///
+    /// Mutually exclusive with [`expire_after_write`](Self::expire_after_write)
+    /// and [`expire_after_access`](Self::expire_after_access). See
+    /// [`Expiry`] and its helper types.
+    pub fn expire_after<E>(mut self, expiry: E) -> Self
+    where
+        E: Expiry<K, V>,
+    {
+        self.expiry = Some(Arc::new(expiry));
         self
     }
 
@@ -189,6 +207,11 @@ where
         if self.expire_after_access.is_some() && self.expire_after_write.is_some() {
             panic!("expire_after_access and expire_after_write are mutually exclusive");
         }
+        if self.expiry.is_some()
+            && (self.expire_after_access.is_some() || self.expire_after_write.is_some())
+        {
+            panic!("expire_after is mutually exclusive with the fixed expiration methods");
+        }
         if self.refresh_after_write.is_some() && self.loader.is_none() {
             panic!("refresh_after_write requires a loader; use build_with_loader");
         }
@@ -199,13 +222,24 @@ where
             (None, None) => u64::MAX / 2,
             (Some(_), Some(_)) => unreachable!("validated above"),
         };
+        let bounded = self.maximum_size.is_some() || self.maximum_weight.is_some();
+        let expiration = match (
+            self.expiry,
+            self.expire_after_write,
+            self.expire_after_access,
+        ) {
+            (Some(expiry), None, None) => Expiration::Custom(expiry),
+            (None, Some(duration), None) => Expiration::AfterWrite(nanos(duration)),
+            (None, None, Some(duration)) => Expiration::AfterAccess(nanos(duration)),
+            _ => Expiration::None,
+        };
 
         let config = Config {
             max_capacity,
             initial_capacity: self.initial_capacity,
             is_weighted: self.maximum_weight.is_some(),
-            expire_after_write: self.expire_after_write.map(nanos),
-            expire_after_access: self.expire_after_access.map(nanos),
+            bounded,
+            expiration,
             refresh_after_write: self.refresh_after_write.map(nanos),
             record_stats: self.record_stats,
             ticker: self.ticker.unwrap_or_else(|| Arc::new(SystemTicker::new())),

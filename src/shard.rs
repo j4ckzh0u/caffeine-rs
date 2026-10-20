@@ -4,13 +4,18 @@
 //! A shard owns a slice of the cache's total capacity.
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 
+use crate::climber::WindowClimber;
+use crate::expiry::{Expiration, NEVER};
 use crate::frequency::FrequencySketch;
 use crate::removal::{RemovalCause, RemovedEntry};
 
 pub(crate) const NIL: u32 = u32::MAX;
+
+/// Caffeine bounds the number of entries transferred per maintenance cycle.
+const QUEUE_TRANSFER_THRESHOLD: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Region {
@@ -41,7 +46,7 @@ struct Node<K, V> {
     weight: u32,
     region: Region,
     write_time: u64,
-    access_time: u64,
+    expire_at: u64,
     refreshing: bool,
     prev: u32,
     next: u32,
@@ -60,32 +65,39 @@ pub(crate) struct Shard<K, V> {
     window: LruList,
     probation: LruList,
     protected: LruList,
+    /// Ordered deadlines, used to expire everything due without a full scan.
+    expiry_index: BTreeMap<(u64, u32), ()>,
     sketch: FrequencySketch,
+    climber: WindowClimber,
     capacity: u64,
     global_max_weight: u64,
+    bounded: bool,
     window_max: u64,
     protected_max: u64,
     total_weight: u64,
     window_weight: u64,
     probation_weight: u64,
     protected_weight: u64,
-    expire_after_write: Option<u64>,
-    expire_after_access: Option<u64>,
+    expiration: Expiration<K, V>,
 }
 
 impl<K, V> Shard<K, V>
 where
-    K: Hash + Eq + Clone,
-    V: Clone,
+    K: Hash + Eq + Clone + 'static,
+    V: Clone + 'static,
 {
     pub(crate) fn new(
         capacity: u64,
         global_max_weight: u64,
         initial_capacity: usize,
-        expire_after_write: Option<u64>,
-        expire_after_access: Option<u64>,
+        expiration: Expiration<K, V>,
+        bounded: bool,
     ) -> Self {
-        let window_max = (capacity / 100).max(1).min(capacity);
+        let window_max = if capacity == 0 {
+            0
+        } else {
+            (capacity / 100).max(1).min(capacity)
+        };
         let main_capacity = capacity.saturating_sub(window_max);
         let protected_max = ((main_capacity as u128 * 4) / 5) as u64;
         Self {
@@ -95,17 +107,19 @@ where
             window: LruList::default(),
             probation: LruList::default(),
             protected: LruList::default(),
+            expiry_index: BTreeMap::new(),
             sketch: FrequencySketch::new(capacity),
+            climber: WindowClimber::new(capacity),
             capacity,
             global_max_weight,
+            bounded,
             window_max,
             protected_max,
             total_weight: 0,
             window_weight: 0,
             probation_weight: 0,
             protected_weight: 0,
-            expire_after_write,
-            expire_after_access,
+            expiration,
         }
     }
 
@@ -115,6 +129,10 @@ where
 
     pub(crate) fn weighted_size(&self) -> u64 {
         self.total_weight
+    }
+
+    pub(crate) fn window_maximum(&self) -> u64 {
+        self.window_max
     }
 
     pub(crate) fn get<Q>(
@@ -128,14 +146,22 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let id = *self.index.get(key)?;
+        self.expire_entries(now, removed);
+        let Some(&id) = self.index.get(key) else {
+            self.record_miss();
+            return None;
+        };
         if self.is_expired(id, now) {
             self.remove_node(id, RemovalCause::Expired, removed);
+            self.record_miss();
             return None;
         }
-        let (value, hash, region, refresh) = {
+        let (value, hash, region, refresh, old_deadline, new_deadline, weight) = {
             let node = self.nodes[id as usize].as_mut().expect("live node");
-            node.access_time = now;
+            let old_deadline = node.expire_at;
+            let new_deadline = self
+                .expiration
+                .on_read(&node.key, &node.value, now, old_deadline);
             let refresh = match refresh_ttl {
                 Some(ttl) if !node.refreshing && now.saturating_sub(node.write_time) >= ttl => {
                     node.refreshing = true;
@@ -143,10 +169,25 @@ where
                 }
                 _ => None,
             };
-            (node.value.clone(), node.hash, node.region, refresh)
+            (
+                node.value.clone(),
+                node.hash,
+                node.region,
+                refresh,
+                old_deadline,
+                new_deadline,
+                node.weight,
+            )
         };
+        if new_deadline != old_deadline {
+            self.reschedule(id, old_deadline, new_deadline);
+        }
+        if weight != 0 {
+            self.record_hit(region == Region::Window, region == Region::Probation);
+        }
         self.sketch.increment(hash);
         self.touch(region, id);
+        self.climb();
         Some(Hit { value, refresh })
     }
 
@@ -160,6 +201,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.expire_entries(now, removed);
         let id = *self.index.get(key)?;
         if self.is_expired(id, now) {
             self.remove_node(id, RemovalCause::Expired, removed);
@@ -184,6 +226,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.expire_entries(now, removed);
         let Some(&id) = self.index.get(key) else {
             return false;
         };
@@ -203,11 +246,17 @@ where
         now: u64,
         removed: &mut Vec<RemovedEntry<K, V>>,
     ) {
+        self.expire_entries(now, removed);
         if let Some(&id) = self.index.get(&key) {
             if weight as u64 > self.global_max_weight {
                 self.remove_node(id, RemovalCause::Replaced, removed);
                 return;
             }
+            let old_deadline = self.nodes[id as usize]
+                .as_ref()
+                .expect("live node")
+                .expire_at;
+            let new_deadline = self.expiration.on_write(&key, &value, now, old_deadline);
             let (old_value, old_weight, region) = {
                 let node = self.nodes[id as usize].as_mut().expect("live node");
                 let old_weight = node.weight;
@@ -216,10 +265,11 @@ where
                 node.hash = hash;
                 node.weight = weight;
                 node.write_time = now;
-                node.access_time = now;
+                node.expire_at = new_deadline;
                 node.refreshing = false;
                 (old_value, old_weight, region)
             };
+            self.reschedule(id, old_deadline, new_deadline);
             self.sub_region_weight(region, old_weight as u64);
             self.add_region_weight(region, weight as u64);
             self.total_weight = self
@@ -235,6 +285,7 @@ where
                 weight: old_weight,
             });
             self.evict(removed);
+            self.climb();
             return;
         }
 
@@ -242,6 +293,7 @@ where
             return;
         }
 
+        let expire_at = self.expiration.on_create(&key, &value, now);
         let id = self.alloc(Node {
             key: key.clone(),
             value,
@@ -249,17 +301,19 @@ where
             weight,
             region: Region::Window,
             write_time: now,
-            access_time: now,
+            expire_at,
             refreshing: false,
             prev: NIL,
             next: NIL,
         });
         self.index.insert(key, id);
+        self.schedule(id, expire_at);
         self.window_weight = self.window_weight.saturating_add(weight as u64);
         self.total_weight = self.total_weight.saturating_add(weight as u64);
         self.link_mru(Region::Window, id);
         self.sketch.increment(hash);
         self.evict(removed);
+        self.climb();
     }
 
     /// Moves a fresh load into the entry captured by a refresh, unless the
@@ -273,6 +327,7 @@ where
         now: u64,
         removed: &mut Vec<RemovedEntry<K, V>>,
     ) {
+        self.expire_entries(now, removed);
         let Some(&id) = self.index.get(key) else {
             return;
         };
@@ -287,6 +342,11 @@ where
             self.remove_node(id, RemovalCause::Size, removed);
             return;
         }
+        let old_deadline = self.nodes[id as usize]
+            .as_ref()
+            .expect("live node")
+            .expire_at;
+        let new_deadline = self.expiration.on_write(key, &value, now, old_deadline);
         let (old_weight, region) = {
             let node = self.nodes[id as usize].as_mut().expect("live node");
             let old_weight = node.weight;
@@ -294,9 +354,11 @@ where
             node.value = value;
             node.weight = weight;
             node.write_time = now;
+            node.expire_at = new_deadline;
             node.refreshing = false;
             (old_weight, region)
         };
+        self.reschedule(id, old_deadline, new_deadline);
         self.sub_region_weight(region, old_weight as u64);
         self.add_region_weight(region, weight as u64);
         self.total_weight = self
@@ -304,6 +366,7 @@ where
             .saturating_sub(old_weight as u64)
             .saturating_add(weight as u64);
         self.evict(removed);
+        self.climb();
     }
 
     pub(crate) fn clear_refreshing(&mut self, key: &K, captured_write: u64) {
@@ -326,6 +389,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.expire_entries(now, removed);
         let id = *self.index.get(key)?;
         if self.is_expired(id, now) {
             self.remove_node(id, RemovalCause::Expired, removed);
@@ -343,12 +407,14 @@ where
         &mut self,
         key: &Q,
         cause: RemovalCause,
+        now: u64,
         removed: &mut Vec<RemovedEntry<K, V>>,
     ) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        self.expire_entries(now, removed);
         let id = *self.index.get(key)?;
         let before = removed.len();
         self.remove_node(id, cause, removed);
@@ -356,22 +422,19 @@ where
     }
 
     pub(crate) fn clean_expired(&mut self, now: u64, removed: &mut Vec<RemovedEntry<K, V>>) {
-        let ids: Vec<u32> = self.index.values().copied().collect();
-        for id in ids {
-            if self.is_expired(id, now) {
-                self.remove_node(id, RemovalCause::Expired, removed);
-            }
-        }
+        self.expire_entries(now, removed);
     }
 
-    /// Clones every live entry. Expired entries are skipped, not removed.
-    pub(crate) fn snapshot(&self, now: u64) -> Vec<(K, V)> {
+    /// Clones every live entry after removing expired entries.
+    pub(crate) fn snapshot(
+        &mut self,
+        now: u64,
+        removed: &mut Vec<RemovedEntry<K, V>>,
+    ) -> Vec<(K, V)> {
+        self.expire_entries(now, removed);
         self.index
             .values()
             .filter_map(|&id| self.nodes[id as usize].as_ref())
-            .filter(|node| {
-                !Self::node_expired(node, now, self.expire_after_write, self.expire_after_access)
-            })
             .map(|node| (node.key.clone(), node.value.clone()))
             .collect()
     }
@@ -393,6 +456,7 @@ where
         }
         self.nodes.clear();
         self.free.clear();
+        self.expiry_index.clear();
         self.window = LruList::default();
         self.probation = LruList::default();
         self.protected = LruList::default();
@@ -401,6 +465,184 @@ where
         self.probation_weight = 0;
         self.protected_weight = 0;
         out
+    }
+
+    // ------------------------------------------------------------------
+    // Expiration
+    // ------------------------------------------------------------------
+
+    fn schedule(&mut self, id: u32, deadline: u64) {
+        if deadline != NEVER {
+            self.expiry_index.insert((deadline, id), ());
+        }
+    }
+
+    fn unschedule(&mut self, id: u32, deadline: u64) {
+        if deadline != NEVER {
+            self.expiry_index.remove(&(deadline, id));
+        }
+    }
+
+    fn reschedule(&mut self, id: u32, old_deadline: u64, new_deadline: u64) {
+        if old_deadline != new_deadline {
+            self.unschedule(id, old_deadline);
+            self.schedule(id, new_deadline);
+            if let Some(node) = self.nodes[id as usize].as_mut() {
+                node.expire_at = new_deadline;
+            }
+        }
+    }
+
+    fn expire_entries(&mut self, now: u64, removed: &mut Vec<RemovedEntry<K, V>>) {
+        if self.expiry_index.is_empty() {
+            return;
+        }
+        while let Some((&(deadline, id), _)) = self.expiry_index.first_key_value() {
+            if deadline > now {
+                break;
+            }
+            self.expiry_index.remove(&(deadline, id));
+            let expected = self
+                .nodes
+                .get(id as usize)
+                .and_then(|node| node.as_ref())
+                .map(|node| node.expire_at);
+            if expected == Some(deadline) {
+                self.remove_node(id, RemovalCause::Expired, removed);
+            }
+        }
+    }
+
+    fn is_expired(&self, id: u32, now: u64) -> bool {
+        let Some(node) = self.nodes[id as usize].as_ref() else {
+            return true;
+        };
+        node.expire_at != NEVER && node.expire_at <= now
+    }
+
+    // ------------------------------------------------------------------
+    // Adaptive window
+    // ------------------------------------------------------------------
+
+    fn record_hit(&mut self, in_window: bool, in_probation: bool) {
+        if self.bounded {
+            self.climber.record_hit(in_window, in_probation);
+        }
+    }
+
+    fn record_miss(&mut self) {
+        if self.bounded {
+            self.climber.record_miss();
+        }
+        self.climb();
+    }
+
+    /// Samples the hit rate and resizes the admission window when due.
+    fn climb(&mut self) {
+        if !self.bounded || self.capacity == 0 {
+            return;
+        }
+        let sample_size = self.sketch.sample_size();
+        if self.total_weight < self.capacity / 2 {
+            self.climber.discard_sample(self.capacity, sample_size);
+        } else {
+            self.climber.determine_adjustment(
+                self.capacity,
+                self.window_max,
+                self.protected_max,
+                sample_size,
+            );
+        }
+        self.demote_protected_to_limit();
+        let adjustment = self.climber.adjustment();
+        if adjustment > 0 {
+            self.increase_window(adjustment as u64);
+        } else if adjustment < 0 {
+            self.decrease_window(adjustment.unsigned_abs());
+        }
+    }
+
+    fn increase_window(&mut self, adjustment: u64) {
+        if self.protected_max == 0 {
+            return;
+        }
+        let quota = adjustment.min(self.protected_max);
+        self.protected_max -= quota;
+        self.window_max = self.window_max.saturating_add(quota);
+        self.demote_protected_to_limit();
+
+        let mut remaining = quota;
+        for _ in 0..QUEUE_TRANSFER_THRESHOLD {
+            let mut source = Region::Probation;
+            let mut candidate = self.probation.tail;
+            if candidate == NIL || self.node_weight(candidate) > remaining {
+                source = Region::Protected;
+                candidate = self.protected.tail;
+            }
+            if candidate == NIL || self.node_weight(candidate) > remaining {
+                break;
+            }
+            remaining -= self.node_weight(candidate);
+            self.move_to(candidate, source, Region::Window);
+        }
+
+        if remaining > 0 {
+            self.protected_max = self.protected_max.saturating_add(remaining);
+            self.window_max = self.window_max.saturating_sub(remaining);
+        }
+        self.climber.carry_over(remaining as i64);
+    }
+
+    fn decrease_window(&mut self, adjustment: u64) {
+        if self.window_max <= 1 {
+            return;
+        }
+        let quota = adjustment.min(self.window_max - 1);
+        self.protected_max = self.protected_max.saturating_add(quota);
+        self.window_max -= quota;
+
+        let mut remaining = quota;
+        let mut candidate = self.window.tail;
+        let mut transfers = 0;
+        while candidate != NIL && transfers < QUEUE_TRANSFER_THRESHOLD {
+            let next = self.nodes[candidate as usize]
+                .as_ref()
+                .expect("live node")
+                .next;
+            let weight = self.node_weight(candidate);
+            if weight == 0 {
+                candidate = next;
+                continue;
+            }
+            if weight > remaining {
+                break;
+            }
+            remaining -= weight;
+            self.move_to(candidate, Region::Window, Region::Probation);
+            transfers += 1;
+            candidate = next;
+        }
+
+        if remaining > 0 {
+            self.protected_max = self.protected_max.saturating_sub(remaining);
+            self.window_max = self.window_max.saturating_add(remaining);
+        }
+        self.climber.carry_over(-(remaining as i64));
+    }
+
+    fn demote_protected_to_limit(&mut self) {
+        let mut transferred = 0;
+        while self.protected_weight > self.protected_max
+            && self.protected.tail != NIL
+            && transferred < QUEUE_TRANSFER_THRESHOLD
+        {
+            self.demote_protected_lru();
+            transferred += 1;
+        }
+    }
+
+    fn node_weight(&self, id: u32) -> u64 {
+        self.nodes[id as usize].as_ref().expect("live node").weight as u64
     }
 
     // ------------------------------------------------------------------
@@ -434,10 +676,7 @@ where
         if candidate == NIL {
             return;
         }
-        let candidate_weight = self.nodes[candidate as usize]
-            .as_ref()
-            .expect("live node")
-            .weight as u64;
+        let candidate_weight = self.node_weight(candidate);
         let main_capacity = self.capacity.saturating_sub(self.window_max);
         let main_weight = self.probation_weight.saturating_add(self.protected_weight);
 
@@ -476,7 +715,7 @@ where
 
     /// Moves the entry between regions, preserving its weight accounting.
     fn move_to(&mut self, id: u32, from: Region, to: Region) {
-        let weight = self.nodes[id as usize].as_ref().expect("live node").weight as u64;
+        let weight = self.node_weight(id);
         self.unlink(from, id);
         self.sub_region_weight(from, weight);
         self.add_region_weight(to, weight);
@@ -528,6 +767,7 @@ where
             return;
         };
         let node = *boxed;
+        self.unschedule(id, node.expire_at);
         self.unlink_raw(node.region, id, node.prev, node.next);
         self.sub_region_weight(node.region, node.weight as u64);
         self.total_weight = self.total_weight.saturating_sub(node.weight as u64);
@@ -539,28 +779,6 @@ where
             cause,
             weight: node.weight,
         });
-    }
-
-    fn is_expired(&self, id: u32, now: u64) -> bool {
-        let Some(node) = self.nodes[id as usize].as_ref() else {
-            return true;
-        };
-        Self::node_expired(node, now, self.expire_after_write, self.expire_after_access)
-    }
-
-    fn node_expired(
-        node: &Node<K, V>,
-        now: u64,
-        expire_after_write: Option<u64>,
-        expire_after_access: Option<u64>,
-    ) -> bool {
-        if let Some(ttl) = expire_after_write {
-            now.saturating_sub(node.write_time) >= ttl
-        } else if let Some(ttl) = expire_after_access {
-            now.saturating_sub(node.access_time) >= ttl
-        } else {
-            false
-        }
     }
 
     fn sub_region_weight(&mut self, region: Region, weight: u64) {

@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use caffeine::{Cache, RemovalCause, Ticker};
+use caffeine::{
+    Cache, Expiry, ExpiryAccessing, ExpiryCreating, ExpiryWriting, RemovalCause, Ticker,
+};
 
 #[derive(Clone, Default)]
 struct FakeTicker {
@@ -477,5 +479,164 @@ fn weight_without_weigher_panics() {
 fn refresh_without_loader_panics() {
     let _: Cache<u64, u64> = Cache::builder()
         .refresh_after_write(Duration::from_secs(1))
+        .build();
+}
+
+#[test]
+fn variable_expiry_uses_per_entry_deadlines() {
+    let ticker = FakeTicker::new();
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(16)
+        .ticker(ticker.clone())
+        .expire_after(ExpiryCreating::new(|_key: &u64, value: &u64| {
+            Some(Duration::from_secs(*value))
+        }))
+        .build();
+
+    cache.insert(1, 2);
+    cache.insert(2, 10);
+    assert!(cache.policy().is_variable_expiration());
+    assert_eq!(cache.policy().expire_after_write(), None);
+
+    ticker.advance(Duration::from_secs(3));
+    assert_eq!(cache.get(&1), None);
+    assert_eq!(cache.get(&2), Some(10));
+
+    ticker.advance(Duration::from_secs(8));
+    assert_eq!(cache.get(&2), None);
+}
+
+#[test]
+fn variable_expiry_extends_on_read() {
+    let ticker = FakeTicker::new();
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(16)
+        .ticker(ticker.clone())
+        .expire_after(ExpiryAccessing::new(|_key: &u64, _value: &u64| {
+            Some(Duration::from_secs(5))
+        }))
+        .build();
+
+    cache.insert(1, 1);
+    ticker.advance(Duration::from_secs(4));
+    assert_eq!(cache.get(&1), Some(1));
+
+    ticker.advance(Duration::from_secs(4));
+    assert_eq!(cache.get(&1), Some(1), "read should extend the deadline");
+
+    ticker.advance(Duration::from_secs(6));
+    assert_eq!(cache.get(&1), None);
+}
+
+#[test]
+fn variable_expiry_update_recalculates_deadline() {
+    let ticker = FakeTicker::new();
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(16)
+        .ticker(ticker.clone())
+        .expire_after(ExpiryWriting::new(|_key: &u64, value: &u64| {
+            Some(Duration::from_secs(*value))
+        }))
+        .build();
+
+    cache.insert(1, 10);
+    ticker.advance(Duration::from_secs(5));
+    cache.insert(1, 2);
+    ticker.advance(Duration::from_secs(3));
+    assert_eq!(cache.get(&1), None, "update should shorten the lifetime");
+}
+
+struct RemainingProbe(Arc<Mutex<Vec<Option<Duration>>>>);
+
+impl Expiry<u64, u64> for RemainingProbe {
+    fn expire_after_create(&self, _key: &u64, _value: &u64, _now: u64) -> Option<Duration> {
+        Some(Duration::from_secs(10))
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &u64,
+        _value: &u64,
+        _now: u64,
+        current: Option<Duration>,
+    ) -> Option<Duration> {
+        self.0.lock().unwrap().push(current);
+        current
+    }
+}
+
+#[test]
+fn variable_expiry_passes_remaining_lifetime_to_update() {
+    let ticker = FakeTicker::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(16)
+        .ticker(ticker.clone())
+        .expire_after(RemainingProbe(Arc::clone(&seen)))
+        .build();
+
+    cache.insert(1, 1);
+    ticker.advance(Duration::from_secs(4));
+    cache.insert(1, 2);
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        &[Some(Duration::from_secs(6))]
+    );
+}
+
+#[test]
+fn expiration_maintenance_removes_every_due_entry() {
+    let ticker = FakeTicker::new();
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(16)
+        .ticker(ticker.clone())
+        .expire_after(ExpiryCreating::new(|_key: &u64, _value: &u64| {
+            Some(Duration::from_secs(1))
+        }))
+        .removal_listener(event_listener(&events))
+        .build();
+
+    for key in 0..5 {
+        cache.insert(key, key);
+    }
+    ticker.advance(Duration::from_secs(2));
+    assert!(!cache.contains_key(&99));
+    assert_eq!(cache.len(), 0);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 5);
+    assert!(events
+        .iter()
+        .all(|(_, _, cause)| *cause == RemovalCause::Expired));
+}
+
+#[test]
+fn adaptive_window_grows_for_recency_workload() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(10).build();
+    assert_eq!(cache.policy().window_maximum(), 1);
+
+    for key in 0..10 {
+        cache.insert(key, key);
+    }
+    for _ in 0..40 {
+        for key in 5..10 {
+            assert!(cache.get(&key).is_some());
+        }
+    }
+
+    assert!(
+        cache.policy().window_maximum() > 1,
+        "hill climber should widen the admission window"
+    );
+}
+
+#[test]
+#[should_panic(expected = "mutually exclusive")]
+fn custom_expiry_conflicts_with_fixed_expiry() {
+    let _: Cache<u64, u64> = Cache::builder()
+        .expire_after_write(Duration::from_secs(1))
+        .expire_after(ExpiryAccessing::new(|_key: &u64, _value: &u64| {
+            Some(Duration::from_secs(1))
+        }))
         .build();
 }

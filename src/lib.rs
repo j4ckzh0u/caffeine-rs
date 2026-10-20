@@ -26,7 +26,8 @@
 //!
 //! - Size-based eviction with W-TinyLFU (`maximum_size`)
 //! - Weight-based eviction with a custom weigher (`maximum_weight` + `weigher`)
-//! - Expiration after write or after access
+//! - Expiration after write, after access, or per entry via [`Expiry`]
+//! - Adaptive admission window sized by hit-rate hill climbing
 //! - Asynchronous refresh after write, with one in-flight refresh per key
 //! - Removal and eviction listeners, with removal causes
 //! - Hit, miss, load, and eviction statistics
@@ -38,18 +39,20 @@
 //!   executor.
 //! - Weak keys/values and soft values are not implemented; Rust ownership
 //!   makes them a different API. Store `Weak`/`Arc` values explicitly.
-//! - Variable per-entry expiration (`Expiry`) and the async cache views are
-//!   not implemented.
-//! - The admission window is fixed at 1% rather than hill-climb adaptive.
-//! - Capacity is sharded proportionally across locks, so retention is a
-//!   close approximation of a single global policy rather than exact.
+//! - The asynchronous cache views are not implemented.
+//! - The adaptive window uses Caffeine's reactive hill-climber at every size;
+//!   the density-tier refinements used for very large caches are not ported.
+//! - Capacity is sharded proportionally across locks, so retention and window
+//!   adaptation are a close approximation of a single global policy.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 mod builder;
 mod cache;
+mod climber;
 mod config;
+mod expiry;
 mod frequency;
 mod removal;
 mod shard;
@@ -58,6 +61,9 @@ mod ticker;
 
 pub use builder::CacheBuilder;
 pub use cache::{Cache, Policy};
+pub use expiry::{
+    Expiry, ExpiryAccessing, ExpiryAfterAccess, ExpiryAfterWrite, ExpiryCreating, ExpiryWriting,
+};
 pub use removal::{EvictionListener, RemovalCause, RemovalListener};
 pub use stats::CacheStats;
 pub use ticker::{SystemTicker, Ticker};

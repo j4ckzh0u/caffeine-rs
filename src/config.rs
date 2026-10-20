@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::expiry::Expiration;
 use crate::removal::{EvictionListener, RemovalListener};
 use crate::ticker::SharedTicker;
 
@@ -13,8 +14,8 @@ pub(crate) struct Config<K, V> {
     pub(crate) max_capacity: u64,
     pub(crate) initial_capacity: usize,
     pub(crate) is_weighted: bool,
-    pub(crate) expire_after_write: Option<u64>,
-    pub(crate) expire_after_access: Option<u64>,
+    pub(crate) bounded: bool,
+    pub(crate) expiration: Expiration<K, V>,
     pub(crate) refresh_after_write: Option<u64>,
     pub(crate) record_stats: bool,
     pub(crate) ticker: SharedTicker,

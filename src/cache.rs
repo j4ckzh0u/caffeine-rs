@@ -56,8 +56,8 @@ where
         let capacities = distribute_capacity(config.max_capacity, shard_count);
         let initial_per_shard = (config.initial_capacity / shard_count).max(1);
         let max_capacity = config.max_capacity;
-        let expire_after_write = config.expire_after_write;
-        let expire_after_access = config.expire_after_access;
+        let expiration = config.expiration.clone();
+        let bounded = config.bounded;
         let shards: Vec<Mutex<Shard<K, V>>> = capacities
             .into_iter()
             .map(|capacity| {
@@ -65,8 +65,8 @@ where
                     capacity,
                     max_capacity,
                     initial_per_shard,
-                    expire_after_write,
-                    expire_after_access,
+                    expiration.clone(),
+                    bounded,
                 ))
             })
             .collect();
@@ -218,12 +218,13 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let now = self.now();
         let hash = self.hash_key(key);
         let shard_index = self.shard_index(hash);
         let mut removed = Vec::new();
         let value = {
             let mut shard = lock(&self.inner.shards[shard_index]);
-            shard.remove(key, RemovalCause::Explicit, &mut removed)
+            shard.remove(key, RemovalCause::Explicit, now, &mut removed)
         };
         self.notify(removed);
         value
@@ -307,14 +308,15 @@ where
 
     /// Clones every live entry into an iterator.
     ///
-    /// Expired entries are skipped but not removed; call
-    /// [`clean_up`](Self::clean_up) for that.
+    /// Expired entries are removed first, exactly as a maintenance pass would.
     pub fn iter(&self) -> std::vec::IntoIter<(K, V)> {
         let now = self.now();
         let mut entries = Vec::new();
+        let mut removed = Vec::new();
         for shard in self.inner.shards.iter() {
-            entries.extend(lock(shard).snapshot(now));
+            entries.extend(lock(shard).snapshot(now, &mut removed));
         }
+        self.notify(removed);
         entries.into_iter()
     }
 
@@ -506,22 +508,46 @@ where
         self.cache.len()
     }
 
-    /// Configured time-to-idle.
+    /// Configured time-to-idle for fixed expiration policies.
+    ///
+    /// Returns `None` for a custom [`Expiry`](crate::Expiry); see
+    /// [`is_variable_expiration`](Self::is_variable_expiration).
     pub fn expire_after_access(&self) -> Option<Duration> {
         self.cache
             .inner
             .config
-            .expire_after_access
+            .expiration
+            .fixed_access()
             .map(Duration::from_nanos)
     }
 
-    /// Configured time-to-live.
+    /// Configured time-to-live for fixed expiration policies.
+    ///
+    /// Returns `None` for a custom [`Expiry`](crate::Expiry); see
+    /// [`is_variable_expiration`](Self::is_variable_expiration).
     pub fn expire_after_write(&self) -> Option<Duration> {
         self.cache
             .inner
             .config
-            .expire_after_write
+            .expiration
+            .fixed_write()
             .map(Duration::from_nanos)
+    }
+
+    /// Returns `true` when a custom per-entry [`Expiry`](crate::Expiry) is in
+    /// effect.
+    pub fn is_variable_expiration(&self) -> bool {
+        self.cache.inner.config.expiration.is_custom()
+    }
+
+    /// Current admission window size, summed across shards.
+    pub fn window_maximum(&self) -> u64 {
+        self.cache
+            .inner
+            .shards
+            .iter()
+            .map(|shard| lock(shard).window_maximum())
+            .sum()
     }
 
     /// Configured refresh interval.
