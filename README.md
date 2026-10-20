@@ -43,20 +43,20 @@ cargo run --example basic
 | Weight-based eviction | ✅ | `maximum_weight` + `weigher` |
 | Expire after write | ✅ | lazy expiration + `clean_up` |
 | Expire after access | ✅ | idle timeout |
-| Both fixed TTLs at once | ❌ | write and access expiration are mutually exclusive here |
+| Both fixed TTLs at once | ✅ | expires when either timeout fires first |
 | Variable per-entry expiry (`Expiry`) | ✅ | create, update, and read hooks |
-| Hill-climbing adaptive window | ✅ | reactive tier, resized per shard |
+| Hill-climbing adaptive window | ✅ | reactive tier up to 4096 entries |
+| Density-tier window heuristics | ✅ | probes, audits, anchors above 4096 entries |
 | Refresh after write | ✅ | async, one in-flight refresh per key |
 | Automatic loading | ✅ | `get_with` / `try_get_with` / `build_with_loader` |
 | Removal listener | ✅ | synchronous, gets the `RemovalCause` |
-| Eviction listener | ✅ | only `RemovalCause::Size` removals |
+| Eviction listener | ✅ | size/weight and expiration removals |
 | Statistics | ✅ | hits, misses, loads, load time, evictions |
 | Custom ticker | ✅ | deterministic time in tests |
 | Custom executor | ✅ | drives refresh tasks |
-| Weak / soft references | ❌ | use explicit `Arc` / `Weak` values |
-| Async cache views | ❌ | the sync cache is thread-safe |
-| Density-tier window heuristics | ❌ | the reactive hill climber runs at every size |
-| JCache / Guava / simulator modules | ❌ | Java-ecosystem integrations |
+| Weak / soft references | N/A | Java GC features; store `Weak` / `Arc` explicitly |
+| Async cache views | N/A | Java `CompletableFuture` adapters; the sync cache is usable from any runtime |
+| JCache / Guava / simulator modules | N/A | Java-platform integrations without a Rust counterpart |
 
 ## Usage
 
@@ -83,9 +83,12 @@ let result: Result<u64, &str> = cache.try_get_with(9, |_| Err("backend down"));
 assert!(result.is_err());
 ```
 
-`get_with` may run the initializer more than once if several threads miss the
-same key at the same time. The cache remains consistent; the last insert wins.
-Send the work through a single-flight helper if duplicate computation matters.
+`get_with` coalesces concurrent misses on the same key: one thread runs the
+initializer while the others wait and reuse the cached value, matching
+Caffeine's per-key computation. If the load fails (or panics), the waiters
+wake and retry, so a failed `try_get_with` is not shared with them. Loading the
+same key recursively from inside its own initializer panics instead of
+deadlocking.
 
 ### Weighted entries
 
@@ -127,6 +130,11 @@ Each shard keeps an ordered deadline index, so all due entries are removed in
 one pass rather than only the key being touched. `len` can still briefly
 include entries whose deadline has passed but which no operation has
 maintained yet, matching Caffeine's maintenance model.
+
+`expire_after_write` and `expire_after_access` may be set together. Reads
+reset only the idle timeout; the write deadline still stands, and the entry
+expires when either deadline arrives first — exactly Caffeine's `hasExpired`
+rule.
 
 For per-entry lifetimes, implement `Expiry` or use one of the built-in
 helpers:
@@ -214,14 +222,14 @@ assert_eq!(policy.estimated_size(), 0);
 ## Architecture
 
 ```text
- key ──hash──► shard index ──► Mutex<Shard>
-                                 ├── HashMap<K, node id>
-                                 ├── Window LRU          (adaptive, starts at 1%)
-                                 ├── Probation LRU       (20% of main)
-                                 ├── Protected LRU       (80% of main)
-                                 ├── 4-bit Count-Min sketch
-                                 ├── ordered expiry deadline index
-                                 └── weight accounting
+ key ──hash──► Mutex<Shard>          (one global policy)
+                 ├── HashMap<K, node id>
+                 ├── Window LRU          (adaptive, starts at 1%)
+                 ├── Probation LRU       (20% of main)
+                 ├── Protected LRU       (80% of main)
+                 ├── 4-bit Count-Min sketch
+                 ├── ordered expiry deadline index
+                 └── weight accounting
 ```
 
 **Admission.** New entries enter the window. When the window overflows, its
@@ -231,24 +239,29 @@ victim; the higher estimated frequency survives. A probation hit promotes the
 entry to protected; protected overflow demotes its LRU entry back to
 probation.
 
-**Frequency sketch.** Four rows of 4-bit saturating counters, one table per
-shard, updated on every read and write. After `10 × capacity` increments the
+**Frequency sketch.** Four rows of 4-bit saturating counters in one global
+table, updated on every read and write. After `10 × capacity` increments the
 counters are halved, so old popularity fades. Frequency is the minimum of the
 four counters.
 
-**Adaptive window.** Caffeine's reactive hill-climber samples the hit rate and
-walks the window size uphill: a 6.25% step (minimum 2 entries), a 0.98 decay
-(0.995 for caches up to 512 entries), and a restart when the hit rate changes
-by 5% or more. Small caches take proportionally longer samples. Window growth
-borrows from the protected segment and transfers main-space entries into the
-window; shrinking reverses the transfer. Each shard adapts independently, and
-`policy().window_maximum()` reports the sum.
+**Adaptive window.** Below 4096 entries the reactive hill-climber samples the
+hit rate and walks the window size uphill: a 6.25% step (minimum 2 entries), a
+0.98 decay (0.995 for caches up to 512 entries), and a restart when the hit
+rate changes by 5% or more. Small caches take proportionally longer samples.
+Above 4096 entries the density tier compares each region's hits per unit of
+capacity, probes starved regions, audits stable positions, and keeps an anchor
+to recover from sustained regressions. Both tiers are direct ports of
+Caffeine's `WindowClimber`, including the starvation/audit ladders, retreat
+budgets, and retry backoff. Window growth borrows from the protected segment
+and transfers main-space entries into the window; shrinking reverses the
+transfer. A single global climber drives the whole cache.
 
-**Sharding.** The capacity is divided across a power-of-two number of shards,
-each with its own lock, index, policy, and sketch. This keeps unrelated keys
-from contending. Small caches collapse to one shard to avoid fragmentation.
-Retention is a close approximation of a single global policy rather than an
-exact global LRU/TinyLFU ordering.
+**One global policy.** Caffeine applies one admission window, one segmented
+main space, and one frequency sketch across the entire cache; only its hash
+table is striped. This crate preserves that exactly by holding the policy
+under one lock. Reads and writes therefore serialize, trading some
+multi-core throughput for policy fidelity. Listeners, loaders, and refresh
+tasks still run outside the lock.
 
 **Why no `unsafe`?** Nodes live in a slab (`Vec<Option<Box<Node>>>`) addressed
 by `u32` ids, and LRU lists are intrusive `prev`/`next` indices. No raw
@@ -257,16 +270,14 @@ pointers are needed.
 ## Concurrency and semantics
 
 - `Cache<K, V>` is a cloneable handle; every method takes `&self`.
-- One mutex is held per operation. Listeners, loaders, and refresh tasks run
-  after it is released; custom `Expiry` callbacks run while it is held.
+- One mutex protects the whole cache. Listeners, loaders, and refresh tasks
+  run after it is released; custom `Expiry` callbacks run while it is held.
 - Listeners run synchronously in the removing thread. They may call back into
   the cache safely.
 - `Expiry` callbacks must not call back into the cache; doing so deadlocks.
 - `get` returns cloned values. Store `Arc<T>` when values are expensive to
   clone.
 - Keys must be `Hash + Eq + Clone`; the policy keeps a copy for ordering.
-- Shard selection uses a randomly seeded hash, so adversarial key sets cannot
-  trivially collapse into one lock.
 
 ## Testing
 
@@ -279,11 +290,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 The suite covers eviction bounds, scan resistance, TTL and idle expiration,
-variable per-entry expiry, adaptive-window growth, refresh coalescing and
-failure recovery, listeners and causes, statistics, weighted eviction,
-loading, iterator/retain behavior, builder validation, and multi-threaded
-stress. Time-dependent tests use a fake `Ticker`; refresh tests use a queue
-`Executor`, so no sleeps are required.
+both fixed TTLs at once, variable per-entry expiry, reactive and density
+window adaptation, coalesced concurrent loads, refresh coalescing and failure
+recovery, listeners and causes, statistics, weighted eviction, zero-weight
+entries, loading, iterator/retain behavior, builder validation, and
+multi-threaded stress. Time-dependent tests use a fake `Ticker`; refresh tests
+use a queue `Executor`, so no sleeps are required.
 
 CI runs on GitHub Actions across every push and pull request, including an
 MSRV (Rust 1.75) check.

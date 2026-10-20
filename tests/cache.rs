@@ -142,6 +142,28 @@ fn expire_after_write_removes_and_notifies() {
 }
 
 #[test]
+fn expiration_notifies_the_eviction_listener_and_stats() {
+    let ticker = FakeTicker::new();
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(10)
+        .expire_after_write(Duration::from_secs(1))
+        .ticker(ticker.clone())
+        .record_stats(true)
+        .eviction_listener(event_listener(&events))
+        .build();
+
+    cache.insert(1, 1);
+    ticker.advance(Duration::from_secs(1));
+    assert_eq!(cache.get(&1), None);
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], (1, 1, RemovalCause::Expired));
+    assert_eq!(cache.stats().eviction_count, 1);
+}
+
+#[test]
 fn expire_after_access_extends_on_read() {
     let ticker = FakeTicker::new();
     let cache: Cache<u64, u64> = Cache::builder()
@@ -173,6 +195,50 @@ fn peek_does_not_extend_access_ttl() {
     assert_eq!(cache.peek(&1), Some(1));
     ticker.advance(Duration::from_secs(2));
     assert_eq!(cache.get(&1), None);
+}
+
+#[test]
+fn both_fixed_ttls_expire_on_the_earlier_access_deadline() {
+    let ticker = FakeTicker::new();
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(10)
+        .expire_after_write(Duration::from_secs(10))
+        .expire_after_access(Duration::from_secs(3))
+        .ticker(ticker.clone())
+        .build();
+
+    cache.insert(1, 1);
+    ticker.advance(Duration::from_secs(2));
+    assert_eq!(cache.get(&1), Some(1));
+    ticker.advance(Duration::from_secs(2));
+    assert_eq!(cache.get(&1), Some(1), "the idle timeout keeps it alive");
+    ticker.advance(Duration::from_secs(3));
+    assert_eq!(
+        cache.get(&1),
+        None,
+        "idle expiration fires before the write deadline"
+    );
+}
+
+#[test]
+fn both_fixed_ttls_expire_on_the_write_deadline_despite_reads() {
+    let ticker = FakeTicker::new();
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_size(10)
+        .expire_after_write(Duration::from_secs(3))
+        .expire_after_access(Duration::from_secs(10))
+        .ticker(ticker.clone())
+        .build();
+
+    cache.insert(1, 1);
+    ticker.advance(Duration::from_secs(2));
+    assert_eq!(cache.get(&1), Some(1));
+    ticker.advance(Duration::from_secs(1));
+    assert_eq!(
+        cache.get(&1),
+        None,
+        "reads must not extend the write deadline"
+    );
 }
 
 #[test]
@@ -343,6 +409,57 @@ fn weighted_eviction_and_oversized_entries() {
 }
 
 #[test]
+fn oversized_entries_are_evicted_with_size() {
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_weight(10)
+        .weigher(|_, value| *value as u32)
+        .eviction_listener(event_listener(&events))
+        .build();
+
+    cache.insert(1, 100);
+    assert!(!cache.contains_key(&1));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0], (1, 100, RemovalCause::Size));
+}
+
+#[test]
+fn replacement_that_outgrows_the_cache_is_evicted_with_size() {
+    let events: Events = Arc::new(Mutex::new(Vec::new()));
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_weight(10)
+        .weigher(|_, value| *value as u32)
+        .eviction_listener(event_listener(&events))
+        .build();
+
+    cache.insert(1, 5);
+    cache.insert(1, 100);
+    assert!(!cache.contains_key(&1));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0],
+        (1, 100, RemovalCause::Size),
+        "the updated value is evicted, not reported as replaced"
+    );
+}
+
+#[test]
+fn zero_weight_entries_are_not_size_evicted() {
+    let cache: Cache<u64, u64> = Cache::builder()
+        .maximum_weight(4)
+        .weigher(|_, _| 0u32)
+        .build();
+
+    for key in 0..20 {
+        cache.insert(key, key);
+    }
+    assert_eq!(cache.len(), 20);
+    assert_eq!(cache.weighted_size(), 0);
+}
+
+#[test]
 fn get_with_caches_loaded_value() {
     let loads = Arc::new(AtomicU64::new(0));
     let counter = Arc::clone(&loads);
@@ -361,6 +478,36 @@ fn get_with_caches_loaded_value() {
         key * 4
     });
     assert_eq!(loads.load(Ordering::SeqCst), 1, "cached value was reused");
+}
+
+#[test]
+fn concurrent_loads_are_coalesced() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(100).build();
+    let loads = Arc::new(AtomicU64::new(0));
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let cache = cache.clone();
+        let loads = Arc::clone(&loads);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            cache.get_with(1, |_| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(50));
+                42
+            })
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), 42);
+    }
+    assert_eq!(
+        loads.load(Ordering::SeqCst),
+        1,
+        "concurrent misses share one load"
+    );
 }
 
 #[test]
@@ -627,6 +774,30 @@ fn adaptive_window_grows_for_recency_workload() {
     assert!(
         cache.policy().window_maximum() > 1,
         "hill climber should widen the admission window"
+    );
+}
+
+#[test]
+fn density_tier_grows_window_for_recency_workload() {
+    let cache: Cache<u64, u64> = Cache::builder().maximum_size(5_000).build();
+    let initial = cache.policy().window_maximum();
+    assert_eq!(initial, 50);
+
+    for key in 0..5_000 {
+        cache.insert(key, key);
+    }
+    // Warm the recent tail of the key space. The density tier compares hits
+    // per capacity and should shift capacity out of main into the window.
+    for _ in 0..50 {
+        for key in 4_500..5_000 {
+            assert!(cache.get(&key).is_some());
+        }
+    }
+
+    assert!(
+        cache.policy().window_maximum() > initial,
+        "density tier should widen the admission window: {}",
+        cache.policy().window_maximum()
     );
 }
 

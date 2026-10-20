@@ -1,10 +1,12 @@
-//! The sharded, thread-safe cache and its policy view.
+//! The thread-safe cache and its policy view.
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use crate::builder::CacheBuilder;
@@ -31,6 +33,33 @@ pub(crate) struct Inner<K, V> {
     pub(crate) shard_mask: usize,
     pub(crate) hasher: RandomState,
     pub(crate) stats: StatsCounters,
+    loads: Mutex<HashMap<K, Arc<LoadSlot>>>,
+}
+
+/// A load in progress, used to coalesce concurrent misses on one key.
+struct LoadSlot {
+    owner: ThreadId,
+    done: Mutex<bool>,
+    ready: Condvar,
+}
+
+struct LoadGuard<'a, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    cache: &'a Cache<K, V>,
+    key: K,
+}
+
+impl<K, V> Drop for LoadGuard<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn drop(&mut self) {
+        self.cache.finish_load(&self.key);
+    }
 }
 
 impl<K, V> Clone for Cache<K, V> {
@@ -78,6 +107,7 @@ where
                 shard_mask: shard_count - 1,
                 hasher: RandomState::new(),
                 stats: StatsCounters::default(),
+                loads: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -164,11 +194,35 @@ where
         if let Some(value) = self.get(&key) {
             return value;
         }
-        let started = Instant::now();
-        let value = init(&key);
-        self.record_load_success(started);
-        self.insert(key, value.clone());
-        value
+        let mut init = Some(init);
+        loop {
+            match self.begin_load(&key) {
+                Some(slot) => {
+                    self.wait_for_load(&slot);
+                    // A non-recording read: the original get already counted
+                    // this request as a miss.
+                    if let Some(value) = self.peek(&key) {
+                        return value;
+                    }
+                    // The loader failed, panicked, or produced a value that
+                    // could not be cached. Try to load again.
+                }
+                None => {
+                    let _guard = LoadGuard {
+                        cache: self,
+                        key: key.clone(),
+                    };
+                    if let Some(value) = self.peek(&key) {
+                        return value;
+                    }
+                    let started = Instant::now();
+                    let value = init.take().expect("the loader runs once")(&key);
+                    self.record_load_success(started);
+                    self.insert(key, value.clone());
+                    return value;
+                }
+            }
+        }
     }
 
     /// Like [`get_with`](Self::get_with), but the loader may fail.
@@ -179,17 +233,80 @@ where
         if let Some(value) = self.get(&key) {
             return Ok(value);
         }
-        let started = Instant::now();
-        match init(&key) {
-            Ok(value) => {
-                self.record_load_success(started);
-                self.insert(key, value.clone());
-                Ok(value)
+        let mut init = Some(init);
+        loop {
+            match self.begin_load(&key) {
+                Some(slot) => {
+                    self.wait_for_load(&slot);
+                    if let Some(value) = self.peek(&key) {
+                        return Ok(value);
+                    }
+                }
+                None => {
+                    let _guard = LoadGuard {
+                        cache: self,
+                        key: key.clone(),
+                    };
+                    if let Some(value) = self.peek(&key) {
+                        return Ok(value);
+                    }
+                    let started = Instant::now();
+                    match init.take().expect("the loader runs once")(&key) {
+                        Ok(value) => {
+                            self.record_load_success(started);
+                            self.insert(key, value.clone());
+                            return Ok(value);
+                        }
+                        Err(error) => {
+                            self.record_load_failure(started);
+                            return Err(error);
+                        }
+                    }
+                }
             }
-            Err(error) => {
-                self.record_load_failure(started);
-                Err(error)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Load coalescing
+    // ------------------------------------------------------------------
+
+    /// Registers a load for `key`, or returns the in-progress load to wait on.
+    fn begin_load(&self, key: &K) -> Option<Arc<LoadSlot>> {
+        let mut loads = lock(&self.inner.loads);
+        if let Some(slot) = loads.get(key) {
+            if slot.owner == std::thread::current().id() {
+                panic!("recursive load of the same key");
             }
+            Some(Arc::clone(slot))
+        } else {
+            loads.insert(
+                key.clone(),
+                Arc::new(LoadSlot {
+                    owner: std::thread::current().id(),
+                    done: Mutex::new(false),
+                    ready: Condvar::new(),
+                }),
+            );
+            None
+        }
+    }
+
+    fn wait_for_load(&self, slot: &LoadSlot) {
+        let mut done = lock(&slot.done);
+        while !*done {
+            done = slot
+                .ready
+                .wait(done)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn finish_load(&self, key: &K) {
+        let slot = lock(&self.inner.loads).remove(key);
+        if let Some(slot) = slot {
+            *lock(&slot.done) = true;
+            slot.ready.notify_all();
         }
     }
 
@@ -560,20 +677,12 @@ where
     }
 }
 
-fn shard_count(capacity: u64) -> usize {
-    let parallelism = std::thread::available_parallelism()
-        .map(|count| count.get())
-        .unwrap_or(1);
-    let max_shards = parallelism.saturating_mul(4).clamp(1, 64);
-    let mut count = 1usize;
-    while count * 2 <= max_shards {
-        count *= 2;
-    }
-    // Small caches would be fragmented by too many shards.
-    while count > 1 && capacity / (count as u64) < 16 {
-        count /= 2;
-    }
-    count
+fn shard_count(_capacity: u64) -> usize {
+    // The eviction policy is global in Caffeine: one admission window, one
+    // segmented main space, one sketch. Keeping a single shard preserves that
+    // exactly; multiple shards would partition the policy and change which
+    // entries are admitted and evicted.
+    1
 }
 
 fn distribute_capacity(capacity: u64, shards: usize) -> Vec<u64> {

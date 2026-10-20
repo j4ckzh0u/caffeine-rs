@@ -26,24 +26,28 @@
 //!
 //! - Size-based eviction with W-TinyLFU (`maximum_size`)
 //! - Weight-based eviction with a custom weigher (`maximum_weight` + `weigher`)
-//! - Expiration after write, after access, or per entry via [`Expiry`]
-//! - Adaptive admission window sized by hit-rate hill climbing
+//! - Expiration after write, after access, both at once, or per entry via [`Expiry`]
+//! - Adaptive admission window: reactive hill climbing up to 4096 entries,
+//!   density feedback with probes and audits above it
 //! - Asynchronous refresh after write, with one in-flight refresh per key
 //! - Removal and eviction listeners, with removal causes
 //! - Hit, miss, load, and eviction statistics
-//! - Sharded, lock-based concurrency with no `unsafe` code
+//! - One global eviction policy under a lock, with no `unsafe` code
 //!
 //! ## Differences from Java Caffeine
 //!
 //! - Listeners run synchronously in the removing thread instead of on an
 //!   executor.
-//! - Weak keys/values and soft values are not implemented; Rust ownership
-//!   makes them a different API. Store `Weak`/`Arc` values explicitly.
-//! - The asynchronous cache views are not implemented.
-//! - The adaptive window uses Caffeine's reactive hill-climber at every size;
-//!   the density-tier refinements used for very large caches are not ported.
-//! - Capacity is sharded proportionally across locks, so retention and window
-//!   adaptation are a close approximation of a single global policy.
+//! - Weak keys/values and soft values are Java garbage-collector features.
+//!   Rust ownership has no equivalent; store `Weak`/`Arc` values explicitly
+//!   and remove dead entries yourself when that behavior is wanted.
+//! - The asynchronous cache views are Java `CompletableFuture` adapters. The
+//!   synchronous cache is `Send + Sync` and can be called from any async
+//!   runtime; refresh already runs on a configurable executor.
+//! - JCache, Guava, and simulator modules are Java-platform integrations and
+//!   have no Rust counterpart.
+//! - Capacity is a single global policy, matching Caffeine's eviction lock,
+//!   rather than a striped approximation.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]

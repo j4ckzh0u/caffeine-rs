@@ -44,7 +44,7 @@ pub struct CacheStats {
     pub load_failure_count: u64,
     /// Total time spent in successful loads.
     pub total_load_time: Duration,
-    /// Number of entries evicted by the size or weight policy.
+    /// Number of entries evicted by the size/weight policy or expiration.
     pub eviction_count: u64,
     /// Total weight of evicted entries.
     pub evicted_weight: u64,

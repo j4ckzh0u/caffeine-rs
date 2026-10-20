@@ -17,8 +17,7 @@ use crate::ticker::{nanos, SharedTicker, SystemTicker, Ticker};
 /// [`build`](Self::build) panics on invalid combinations:
 /// - both `maximum_size` and `maximum_weight`
 /// - `maximum_weight` without a `weigher`, or a `weigher` without `maximum_weight`
-/// - both `expire_after_access` and `expire_after_write`
-/// - more than one of `expire_after_write`, `expire_after_access`, and `expire_after`
+/// - `expire_after` combined with `expire_after_write` or `expire_after_access`
 /// - `refresh_after_write` without a loader
 pub struct CacheBuilder<K, V> {
     maximum_size: Option<usize>,
@@ -79,7 +78,8 @@ impl<K, V> CacheBuilder<K, V> {
 
     /// Expires an entry `duration` after its last write (insert or replace).
     ///
-    /// Mutually exclusive with [`expire_after_access`](Self::expire_after_access).
+    /// May be combined with [`expire_after_access`](Self::expire_after_access);
+    /// the entry then expires when either timeout fires first.
     pub fn expire_after_write(mut self, duration: Duration) -> Self {
         self.expire_after_write = Some(duration);
         self
@@ -87,8 +87,9 @@ impl<K, V> CacheBuilder<K, V> {
 
     /// Expires an entry `duration` after its last read or write.
     ///
-    /// Mutually exclusive with [`expire_after_write`](Self::expire_after_write)
-    /// and [`expire_after`](Self::expire_after).
+    /// May be combined with [`expire_after_write`](Self::expire_after_write);
+    /// the entry then expires when either timeout fires first. Mutually
+    /// exclusive with [`expire_after`](Self::expire_after).
     pub fn expire_after_access(mut self, duration: Duration) -> Self {
         self.expire_after_access = Some(duration);
         self
@@ -157,7 +158,7 @@ impl<K, V> CacheBuilder<K, V> {
         self
     }
 
-    /// Called only for entries evicted by the size/weight policy.
+    /// Called for entries evicted by the size/weight policy or expiration.
     pub fn eviction_listener<F>(mut self, listener: F) -> Self
     where
         F: Fn(&K, &V, RemovalCause) + Send + Sync + 'static,
@@ -204,9 +205,6 @@ where
         if self.weigher.is_some() && self.maximum_weight.is_none() {
             panic!("a weigher requires maximum_weight");
         }
-        if self.expire_after_access.is_some() && self.expire_after_write.is_some() {
-            panic!("expire_after_access and expire_after_write are mutually exclusive");
-        }
         if self.expiry.is_some()
             && (self.expire_after_access.is_some() || self.expire_after_write.is_some())
         {
@@ -229,6 +227,10 @@ where
             self.expire_after_access,
         ) {
             (Some(expiry), None, None) => Expiration::Custom(expiry),
+            (None, Some(write), Some(access)) => Expiration::Both {
+                write: nanos(write),
+                access: nanos(access),
+            },
             (None, Some(duration), None) => Expiration::AfterWrite(nanos(duration)),
             (None, None, Some(duration)) => Expiration::AfterAccess(nanos(duration)),
             _ => Expiration::None,

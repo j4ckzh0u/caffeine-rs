@@ -16,16 +16,18 @@ pub enum RemovalCause {
 }
 
 impl RemovalCause {
-    /// Returns `true` if this removal was an eviction by the policy.
+    /// Returns `true` for removals the cache performed on the caller's behalf
+    /// due to size, weight, or expiration. Manual removal and replacement are
+    /// not evictions.
     pub fn was_evicted(self) -> bool {
-        matches!(self, RemovalCause::Size)
+        matches!(self, RemovalCause::Size | RemovalCause::Expired)
     }
 }
 
 /// Called for every entry removed from the cache, in the removing thread.
 pub type RemovalListener<K, V> = Arc<dyn Fn(&K, &V, RemovalCause) + Send + Sync + 'static>;
 
-/// Called only for entries evicted by the size or weight policy.
+/// Called for entries evicted by the size/weight policy or by expiration.
 pub type EvictionListener<K, V> = Arc<dyn Fn(&K, &V, RemovalCause) + Send + Sync + 'static>;
 
 pub(crate) struct RemovedEntry<K, V> {

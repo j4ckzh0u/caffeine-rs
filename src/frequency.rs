@@ -11,6 +11,8 @@ const SEEDS: [u64; DEPTH] = [
 /// Counters are 4 bits wide, so a `u64` word holds 16 of them.
 const COUNTERS_PER_WORD: usize = 16;
 const HALVE_MASK: u64 = 0x7777_7777_7777_7777;
+/// The low bit of every counter, used to count how many were odd before aging.
+const ONE_MASK: u64 = 0x1111_1111_1111_1111;
 const MAX_WIDTH: u64 = 1 << 20;
 
 /// Approximate frequency counts with 4-bit saturating counters.
@@ -22,6 +24,7 @@ pub(crate) struct FrequencySketch {
     mask: usize,
     sample_size: u64,
     size: u64,
+    initialized: bool,
 }
 
 impl FrequencySketch {
@@ -35,7 +38,13 @@ impl FrequencySketch {
             mask: width - 1,
             sample_size: capacity.saturating_mul(10).max(10),
             size: 0,
+            initialized: false,
         }
+    }
+
+    /// Whether the sketch has yet to see its first write.
+    pub(crate) fn is_not_initialized(&self) -> bool {
+        !self.initialized
     }
 
     /// Number of recorded usages between sketch resets.
@@ -55,6 +64,7 @@ impl FrequencySketch {
 
     /// Records one usage of `hash`, aging the sketch when it is due.
     pub(crate) fn increment(&mut self, hash: u64) {
+        self.initialized = true;
         let mut added = false;
         for (row, seed) in SEEDS.iter().enumerate() {
             let index = self.index(hash, *seed, row);
@@ -91,10 +101,12 @@ impl FrequencySketch {
     }
 
     fn reset(&mut self) {
+        let mut odd_count = 0u64;
         for word in &mut self.table {
+            odd_count += (*word & ONE_MASK).count_ones() as u64;
             *word = (*word >> 1) & HALVE_MASK;
         }
-        self.size /= 2;
+        self.size = self.size.saturating_sub(odd_count >> 2) >> 1;
     }
 }
 

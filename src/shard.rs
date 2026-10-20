@@ -1,14 +1,15 @@
-//! A single cache shard: hash index + intrusive LRU lists + W-TinyLFU policy.
-//!
-//! Each shard is protected by its own mutex, so unrelated keys do not contend.
-//! A shard owns a slice of the cache's total capacity.
+//! The cache's data and eviction policy: hash index + intrusive LRU lists +
+//! W-TinyLFU. A single shard holds the whole cache so the admission window,
+//! segmented main space, sketch, and climber are global, as in Caffeine.
 
 use std::borrow::Borrow;
+use std::cell::Cell;
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::climber::WindowClimber;
-use crate::expiry::{Expiration, NEVER};
+use crate::expiry::{Deadlines, Expiration, NEVER};
 use crate::frequency::FrequencySketch;
 use crate::removal::{RemovalCause, RemovedEntry};
 
@@ -16,6 +17,40 @@ pub(crate) const NIL: u32 = u32::MAX;
 
 /// Caffeine bounds the number of entries transferred per maintenance cycle.
 const QUEUE_TRANSFER_THRESHOLD: usize = 1_000;
+
+/// A warm candidate may still be admitted against a warm victim at random to
+/// blunt frequency-skewing attacks. The frequency counters max out at 15 and
+/// are halved on reset, so 6 identifies a warm entry.
+const ADMIT_HASHDOS_THRESHOLD: u8 = 6;
+
+thread_local! {
+    static ADMIT_RANDOM: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Returns whether the window candidate should displace the main victim.
+fn admit(candidate: u8, victim: u8) -> bool {
+    if candidate > victim {
+        return true;
+    }
+    if candidate < ADMIT_HASHDOS_THRESHOLD {
+        return false;
+    }
+    // One in 128 warm candidates is admitted at random, matching Caffeine's
+    // `(random & 127) == 0` hash-DoS guard.
+    ADMIT_RANDOM.with(|cell| {
+        let mut seed = cell.get();
+        if seed == 0 {
+            let mut hasher = RandomState::new().build_hasher();
+            hasher.write_u64(std::process::id() as u64);
+            seed = hasher.finish() | 1;
+        }
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        cell.set(seed);
+        (seed & 127) == 0
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Region {
@@ -46,7 +81,10 @@ struct Node<K, V> {
     weight: u32,
     region: Region,
     write_time: u64,
+    /// Effective deadline: the earlier of the access and write deadlines.
     expire_at: u64,
+    /// Write deadline retained when both fixed TTLs are configured.
+    write_expire_at: u64,
     refreshing: bool,
     prev: u32,
     next: u32,
@@ -147,21 +185,23 @@ where
         Q: Hash + Eq + ?Sized,
     {
         self.expire_entries(now, removed);
-        let Some(&id) = self.index.get(key) else {
-            self.record_miss();
-            return None;
-        };
+        let &id = self.index.get(key)?;
         if self.is_expired(id, now) {
             self.remove_node(id, RemovalCause::Expired, removed);
-            self.record_miss();
             return None;
         }
-        let (value, hash, region, refresh, old_deadline, new_deadline, weight) = {
+        let (value, hash, region, refresh, old_deadline, new_deadlines, weight) = {
             let node = self.nodes[id as usize].as_mut().expect("live node");
             let old_deadline = node.expire_at;
-            let new_deadline = self
-                .expiration
-                .on_read(&node.key, &node.value, now, old_deadline);
+            let new_deadlines = self.expiration.on_read(
+                &node.key,
+                &node.value,
+                now,
+                Deadlines {
+                    at: node.expire_at,
+                    write_at: node.write_expire_at,
+                },
+            );
             let refresh = match refresh_ttl {
                 Some(ttl) if !node.refreshing && now.saturating_sub(node.write_time) >= ttl => {
                     node.refreshing = true;
@@ -175,12 +215,15 @@ where
                 node.region,
                 refresh,
                 old_deadline,
-                new_deadline,
+                new_deadlines,
                 node.weight,
             )
         };
-        if new_deadline != old_deadline {
-            self.reschedule(id, old_deadline, new_deadline);
+        if new_deadlines.at != old_deadline {
+            self.reschedule(id, old_deadline, new_deadlines.at);
+        }
+        if let Some(node) = self.nodes[id as usize].as_mut() {
+            node.write_expire_at = new_deadlines.write_at;
         }
         if weight != 0 {
             self.record_hit(region == Region::Window, region == Region::Probation);
@@ -248,15 +291,20 @@ where
     ) {
         self.expire_entries(now, removed);
         if let Some(&id) = self.index.get(&key) {
-            if weight as u64 > self.global_max_weight {
-                self.remove_node(id, RemovalCause::Replaced, removed);
-                return;
-            }
-            let old_deadline = self.nodes[id as usize]
-                .as_ref()
-                .expect("live node")
-                .expire_at;
-            let new_deadline = self.expiration.on_write(&key, &value, now, old_deadline);
+            let (old_deadline, new_deadlines) = {
+                let node = self.nodes[id as usize].as_ref().expect("live node");
+                let old_deadline = node.expire_at;
+                let new_deadlines = self.expiration.on_write(
+                    &key,
+                    &value,
+                    now,
+                    Deadlines {
+                        at: node.expire_at,
+                        write_at: node.write_expire_at,
+                    },
+                );
+                (old_deadline, new_deadlines)
+            };
             let (old_value, old_weight, region) = {
                 let node = self.nodes[id as usize].as_mut().expect("live node");
                 let old_weight = node.weight;
@@ -265,19 +313,36 @@ where
                 node.hash = hash;
                 node.weight = weight;
                 node.write_time = now;
-                node.expire_at = new_deadline;
+                node.expire_at = new_deadlines.at;
+                node.write_expire_at = new_deadlines.write_at;
                 node.refreshing = false;
                 (old_value, old_weight, region)
             };
-            self.reschedule(id, old_deadline, new_deadline);
+            self.reschedule(id, old_deadline, new_deadlines.at);
             self.sub_region_weight(region, old_weight as u64);
             self.add_region_weight(region, weight as u64);
             self.total_weight = self
                 .total_weight
                 .saturating_sub(old_weight as u64)
                 .saturating_add(weight as u64);
-            self.sketch.increment(hash);
-            self.touch(region, id);
+            if weight as u64 > self.global_max_weight {
+                // The updated entry no longer fits: Caffeine evicts it with
+                // SIZE rather than reporting a replacement.
+                drop(old_value);
+                self.remove_node(id, RemovalCause::Size, removed);
+                self.evict(removed);
+                self.climb();
+                return;
+            }
+            if (region == Region::Window) && (weight as u64 > self.window_max) {
+                // Between the window and cache maxima the entry is parked at
+                // the window's LRU so the next transfer moves it to main.
+                // Caffeine reorders without recording a sketch usage here.
+                self.move_lru(Region::Window, id);
+            } else {
+                self.sketch.increment(hash);
+                self.touch(region, id);
+            }
             removed.push(RemovedEntry {
                 key,
                 value: old_value,
@@ -289,11 +354,7 @@ where
             return;
         }
 
-        if weight as u64 > self.global_max_weight {
-            return;
-        }
-
-        let expire_at = self.expiration.on_create(&key, &value, now);
+        let deadlines = self.expiration.on_create(&key, &value, now);
         let id = self.alloc(Node {
             key: key.clone(),
             value,
@@ -301,17 +362,27 @@ where
             weight,
             region: Region::Window,
             write_time: now,
-            expire_at,
+            expire_at: deadlines.at,
+            write_expire_at: deadlines.write_at,
             refreshing: false,
             prev: NIL,
             next: NIL,
         });
         self.index.insert(key, id);
-        self.schedule(id, expire_at);
+        self.schedule(id, deadlines.at);
         self.window_weight = self.window_weight.saturating_add(weight as u64);
         self.total_weight = self.total_weight.saturating_add(weight as u64);
-        self.link_mru(Region::Window, id);
+        if weight as u64 > self.window_max {
+            self.link_lru(Region::Window, id);
+        } else {
+            self.link_mru(Region::Window, id);
+        }
         self.sketch.increment(hash);
+        // A new entry is a miss in the adaptive-window sample, matching the
+        // write that filled it; a plain lookup miss is not counted.
+        if self.bounded {
+            self.climber.record_miss();
+        }
         self.evict(removed);
         self.climb();
     }
@@ -338,15 +409,20 @@ where
         if !matches {
             return;
         }
-        if weight as u64 > self.global_max_weight {
-            self.remove_node(id, RemovalCause::Size, removed);
-            return;
-        }
-        let old_deadline = self.nodes[id as usize]
-            .as_ref()
-            .expect("live node")
-            .expire_at;
-        let new_deadline = self.expiration.on_write(key, &value, now, old_deadline);
+        let (old_deadline, new_deadlines) = {
+            let node = self.nodes[id as usize].as_ref().expect("live node");
+            let old_deadline = node.expire_at;
+            let new_deadlines = self.expiration.on_write(
+                key,
+                &value,
+                now,
+                Deadlines {
+                    at: node.expire_at,
+                    write_at: node.write_expire_at,
+                },
+            );
+            (old_deadline, new_deadlines)
+        };
         let (old_weight, region) = {
             let node = self.nodes[id as usize].as_mut().expect("live node");
             let old_weight = node.weight;
@@ -354,17 +430,31 @@ where
             node.value = value;
             node.weight = weight;
             node.write_time = now;
-            node.expire_at = new_deadline;
+            node.expire_at = new_deadlines.at;
+            node.write_expire_at = new_deadlines.write_at;
             node.refreshing = false;
             (old_weight, region)
         };
-        self.reschedule(id, old_deadline, new_deadline);
+        self.reschedule(id, old_deadline, new_deadlines.at);
         self.sub_region_weight(region, old_weight as u64);
         self.add_region_weight(region, weight as u64);
         self.total_weight = self
             .total_weight
             .saturating_sub(old_weight as u64)
             .saturating_add(weight as u64);
+        let hash = self.nodes[id as usize].as_ref().expect("live node").hash;
+        // A reload records a climber miss, but not a hit or a sketch usage.
+        if self.bounded {
+            self.climber.record_miss();
+        }
+        if weight as u64 > self.global_max_weight {
+            self.remove_node(id, RemovalCause::Size, removed);
+        } else if (region == Region::Window) && (weight as u64 > self.window_max) {
+            self.move_lru(Region::Window, id);
+        } else {
+            self.sketch.increment(hash);
+            self.touch(region, id);
+        }
         self.evict(removed);
         self.climb();
     }
@@ -530,20 +620,15 @@ where
         }
     }
 
-    fn record_miss(&mut self) {
-        if self.bounded {
-            self.climber.record_miss();
-        }
-        self.climb();
-    }
-
     /// Samples the hit rate and resizes the admission window when due.
     fn climb(&mut self) {
         if !self.bounded || self.capacity == 0 {
             return;
         }
         let sample_size = self.sketch.sample_size();
-        if self.total_weight < self.capacity / 2 {
+        if self.sketch.is_not_initialized() {
+            self.climber.reset_sample();
+        } else if self.total_weight < self.capacity / 2 {
             self.climber.discard_sample(self.capacity, sample_size);
         } else {
             self.climber.determine_adjustment(
@@ -650,67 +735,132 @@ where
     // ------------------------------------------------------------------
 
     fn evict(&mut self, removed: &mut Vec<RemovedEntry<K, V>>) {
-        loop {
-            if self.window_weight > self.window_max && self.window.tail != NIL {
-                self.evict_window_candidate(removed);
-            } else if self.protected_weight > self.protected_max {
-                self.demote_protected_lru();
-            } else if self.total_weight > self.capacity {
-                let victim = if self.probation.tail != NIL {
-                    self.probation.tail
-                } else {
-                    self.protected.tail
-                };
-                if victim == NIL {
-                    break;
-                }
-                self.remove_node(victim, RemovalCause::Size, removed);
-            } else {
+        let candidate = self.evict_from_window();
+        self.evict_from_main(candidate, removed);
+    }
+
+    /// Transfers the window's overflow into probation, skipping zero-weight
+    /// entries and bounding the work per maintenance cycle. Returns the first
+    /// promoted entry, which becomes the first admission candidate.
+    fn evict_from_window(&mut self) -> Option<u32> {
+        let mut first = None;
+        let mut remaining = QUEUE_TRANSFER_THRESHOLD;
+        let mut node = self.option(self.window.tail);
+        while self.window_weight > self.window_max {
+            let Some(id) = node else {
                 break;
+            };
+            if remaining == 0 {
+                break;
+            }
+            let next = self.nodes[id as usize].as_ref().expect("live node").prev;
+            if self.node_weight(id) != 0 {
+                self.move_to(id, Region::Window, Region::Probation);
+                if first.is_none() {
+                    first = Some(id);
+                }
+                remaining -= 1;
+            }
+            node = self.option(next);
+        }
+        first
+    }
+
+    /// Evicts entries while the cache exceeds its maximum, comparing the
+    /// window's admission candidates against the main space's victims by
+    /// frequency. Ties prefer the resident victim, matching Caffeine.
+    fn evict_from_main(
+        &mut self,
+        mut candidate: Option<u32>,
+        removed: &mut Vec<RemovedEntry<K, V>>,
+    ) {
+        let mut victim_queue = Region::Probation;
+        let mut candidate_queue = Region::Probation;
+        let mut victim = self.option(self.probation.tail);
+
+        while self.total_weight > self.capacity {
+            if candidate.is_none() && candidate_queue == Region::Probation {
+                candidate = self.option(self.window.tail);
+                candidate_queue = Region::Window;
+            }
+
+            if candidate.is_none() && victim.is_none() {
+                match victim_queue {
+                    Region::Probation => {
+                        victim = self.option(self.protected.tail);
+                        victim_queue = Region::Protected;
+                        continue;
+                    }
+                    Region::Protected => {
+                        victim = self.option(self.window.tail);
+                        victim_queue = Region::Window;
+                        continue;
+                    }
+                    Region::Window => break,
+                }
+            }
+
+            if let Some(id) = victim {
+                if self.node_weight(id) == 0 {
+                    victim = self.next_toward_mru(id);
+                    continue;
+                }
+            }
+            if let Some(id) = candidate {
+                if self.node_weight(id) == 0 {
+                    candidate = self.next_toward_mru(id);
+                    continue;
+                }
+            }
+
+            match (victim, candidate) {
+                (None, Some(id)) => {
+                    candidate = self.evict_and_advance(id, removed);
+                }
+                (Some(id), None) => {
+                    victim = self.evict_and_advance(id, removed);
+                }
+                (Some(v), Some(c)) if v == c => {
+                    victim = self.evict_and_advance(v, removed);
+                    candidate = None;
+                }
+                (Some(v), Some(c)) => {
+                    if self.node_weight(c) > self.capacity {
+                        candidate = self.evict_and_advance(c, removed);
+                        continue;
+                    }
+                    let candidate_frequency = self.frequency(c);
+                    let victim_frequency = self.frequency(v);
+                    if admit(candidate_frequency, victim_frequency) {
+                        victim = self.evict_and_advance(v, removed);
+                        candidate = self.next_toward_mru(c);
+                    } else {
+                        candidate = self.evict_and_advance(c, removed);
+                    }
+                }
+                (None, None) => break,
             }
         }
     }
 
-    fn evict_window_candidate(&mut self, removed: &mut Vec<RemovedEntry<K, V>>) {
-        let candidate = self.window.tail;
-        if candidate == NIL {
-            return;
-        }
-        let candidate_weight = self.node_weight(candidate);
-        let main_capacity = self.capacity.saturating_sub(self.window_max);
-        let main_weight = self.probation_weight.saturating_add(self.protected_weight);
+    fn evict_and_advance(&mut self, id: u32, removed: &mut Vec<RemovedEntry<K, V>>) -> Option<u32> {
+        let next = self.next_toward_mru(id);
+        self.remove_node(id, RemovalCause::Size, removed);
+        next
+    }
 
-        if main_weight.saturating_add(candidate_weight) <= main_capacity {
-            self.move_to(candidate, Region::Window, Region::Probation);
-            return;
-        }
+    fn next_toward_mru(&self, id: u32) -> Option<u32> {
+        let prev = self.nodes[id as usize].as_ref().expect("live node").prev;
+        self.option(prev)
+    }
 
-        if self.probation.tail != NIL {
-            let victim = self.probation.tail;
-            let candidate_frequency = self.sketch.frequency(
-                self.nodes[candidate as usize]
-                    .as_ref()
-                    .expect("live node")
-                    .hash,
-            );
-            let victim_frequency = self.sketch.frequency(
-                self.nodes[victim as usize]
-                    .as_ref()
-                    .expect("live node")
-                    .hash,
-            );
-            if candidate_frequency > victim_frequency {
-                self.remove_node(victim, RemovalCause::Size, removed);
-                self.move_to(candidate, Region::Window, Region::Probation);
-            } else {
-                self.remove_node(candidate, RemovalCause::Size, removed);
-            }
-        } else if self.protected.tail != NIL {
-            // Make room in probation for the admission comparison.
-            self.demote_protected_lru();
-        } else {
-            self.remove_node(candidate, RemovalCause::Size, removed);
-        }
+    fn frequency(&self, id: u32) -> u8 {
+        self.sketch
+            .frequency(self.nodes[id as usize].as_ref().expect("live node").hash)
+    }
+
+    fn option(&self, id: u32) -> Option<u32> {
+        (id != NIL).then_some(id)
     }
 
     /// Moves the entry between regions, preserving its weight accounting.
@@ -723,14 +873,17 @@ where
         self.link_mru(to, id);
     }
 
-    /// A probation hit earns promotion to the protected segment.
+    /// A probation hit earns promotion to the protected segment, unless the
+    /// entry is too heavy for it; protected overage is demoted during the next
+    /// climber pass, matching Caffeine's deferred adaptation.
     fn touch(&mut self, region: Region, id: u32) {
         match region {
             Region::Window | Region::Protected => self.move_mru(region, id),
             Region::Probation => {
-                self.move_to(id, Region::Probation, Region::Protected);
-                while self.protected_weight > self.protected_max && self.protected.tail != NIL {
-                    self.demote_protected_lru();
+                if self.node_weight(id) > self.protected_max {
+                    self.move_mru(Region::Probation, id);
+                } else {
+                    self.move_to(id, Region::Probation, Region::Protected);
                 }
             }
         }
@@ -749,6 +902,14 @@ where
         }
         self.unlink(region, id);
         self.link_mru(region, id);
+    }
+
+    fn move_lru(&mut self, region: Region, id: u32) {
+        if self.list(region).tail == id {
+            return;
+        }
+        self.unlink(region, id);
+        self.link_lru(region, id);
     }
 
     fn alloc(&mut self, node: Node<K, V>) -> u32 {
@@ -842,6 +1003,21 @@ where
             self.nodes[head as usize].as_mut().expect("live node").prev = id;
         }
         self.list_mut(region).head = id;
+    }
+
+    fn link_lru(&mut self, region: Region, id: u32) {
+        let tail = self.list(region).tail;
+        {
+            let node = self.nodes[id as usize].as_mut().expect("live node");
+            node.prev = tail;
+            node.next = NIL;
+        }
+        if tail == NIL {
+            self.list_mut(region).head = id;
+        } else {
+            self.nodes[tail as usize].as_mut().expect("live node").next = id;
+        }
+        self.list_mut(region).tail = id;
     }
 
     fn unlink(&mut self, region: Region, id: u32) {
