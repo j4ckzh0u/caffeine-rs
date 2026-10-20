@@ -81,11 +81,7 @@ impl CacheStats {
 
     /// Average time spent in a successful load, or zero when there were none.
     pub fn average_load_penalty(&self) -> Duration {
-        let loads = self.load_success_count;
-        if loads == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.total_load_time.as_nanos() as u64 / loads)
-        }
+        let nanos = self.total_load_time.as_nanos() as u64;
+        Duration::from_nanos(nanos.checked_div(self.load_success_count).unwrap_or(0))
     }
 }
