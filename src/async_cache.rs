@@ -390,6 +390,10 @@ where
 
         let loader = Arc::clone(&self.loader);
         let cache = self.cache.synchronous().clone();
+        let Some(captured_write) = cache.write_time_of(key) else {
+            lock(&self.refreshes).remove(key);
+            return;
+        };
         let pending = Arc::clone(&self.refreshes);
         let load_key = key.clone();
         let tracked_key = key.clone();
@@ -400,7 +404,7 @@ where
                     block_on(loader(load_key))
                 }));
                 if let Ok(value) = outcome {
-                    if cache.contains_key(&tracked_key) {
+                    if cache.write_time_of(&tracked_key) == Some(captured_write) {
                         cache.insert(tracked_key.clone(), value);
                     }
                 }

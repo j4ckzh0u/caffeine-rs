@@ -209,6 +209,23 @@ where
         Some(now.saturating_sub(timestamp))
     }
 
+    pub(crate) fn write_time_of<Q>(&self, key: &Q, now: u64) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let &id = self.index.get(key)?;
+        if self.is_expired(id, now) {
+            return None;
+        }
+        Some(
+            self.nodes[id as usize]
+                .as_ref()
+                .expect("live node")
+                .write_time,
+        )
+    }
+
     pub(crate) fn expires_at<Q>(&self, key: &Q, now: u64) -> Option<u64>
     where
         K: Borrow<Q>,

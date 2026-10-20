@@ -692,6 +692,17 @@ where
             .map(Duration::from_nanos)
     }
 
+    pub(crate) fn write_time_of<Q>(&self, key: &Q) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        lock(&self.inner.shards[shard_index]).write_time_of(key, now)
+    }
+
     /// Absolute expiration deadline in ticker nanoseconds.
     pub fn expires_at<Q>(&self, key: &Q) -> Option<u64>
     where
