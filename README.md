@@ -60,7 +60,7 @@ cargo run --example basic
 | Async cache views | ✅ | `AsyncCache` / `AsyncLoadingCache`, builder constructors |
 | Guava adapter | ✅ | `guava` module: builder, cache, loading cache, conversions |
 | JCache adapter | ✅ | `jcache` module: JSR-107-shaped provider, manager, cache |
-| Simulator | ✅ | trace replay for W-TinyLFU, LRU, and LFU |
+| Simulator | ✅ | trace replay for W-TinyLFU, LRU, LFU, FIFO, SLRU, CLOCK, and Optimal |
 
 ## Usage
 
@@ -329,7 +329,8 @@ per-entry view (`put`, `put_if_absent`, `set_expires_after`, `oldest`,
 ### Simulator
 
 The `simulator` module replays access traces against this crate's W-TinyLFU
-policy or reference LRU/LFU implementations:
+policy or reference implementations of LRU, LFU, FIFO, SLRU, CLOCK, and
+Belady's optimal policy:
 
 ```rust
 use caffeine::simulator::{simulate, Policy};

@@ -14,7 +14,7 @@
 //! ```
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::cache::Cache;
 
@@ -27,6 +27,14 @@ pub enum Policy {
     Lru,
     /// A least-frequently-used policy, breaking ties by recency.
     Lfu,
+    /// First in, first out.
+    Fifo,
+    /// A segmented LRU with protected and probation regions.
+    Slru,
+    /// The CLOCK second-chance approximation of LRU.
+    Clock,
+    /// Belady's optimal policy, using knowledge of future accesses.
+    Optimal,
 }
 
 /// Results of replaying a trace.
@@ -71,6 +79,10 @@ pub fn simulate(
         Policy::Wtinylfu => simulate_wtinylfu(trace, maximum_size),
         Policy::Lru => simulate_lru(trace, maximum_size),
         Policy::Lfu => simulate_lfu(trace, maximum_size),
+        Policy::Fifo => simulate_fifo(trace, maximum_size),
+        Policy::Slru => simulate_slru(trace, maximum_size),
+        Policy::Clock => simulate_clock(trace, maximum_size),
+        Policy::Optimal => simulate_optimal(trace, maximum_size),
     }
 }
 
@@ -120,6 +132,193 @@ fn simulate_lfu(trace: impl IntoIterator<Item = u64>, maximum_size: usize) -> Po
                 stats.evictions += 1;
             }
         }
+    }
+    stats
+}
+
+fn simulate_fifo(trace: impl IntoIterator<Item = u64>, maximum_size: usize) -> PolicyStats {
+    let mut order = VecDeque::new();
+    let mut entries = HashSet::new();
+    let mut stats = PolicyStats::default();
+    for key in trace {
+        if entries.contains(&key) {
+            stats.hits += 1;
+            continue;
+        }
+        stats.misses += 1;
+        if maximum_size == 0 {
+            stats.evictions += 1;
+            continue;
+        }
+        if entries.len() >= maximum_size {
+            if let Some(victim) = order.pop_front() {
+                entries.remove(&victim);
+                stats.evictions += 1;
+            }
+        }
+        entries.insert(key);
+        order.push_back(key);
+    }
+    stats
+}
+
+fn simulate_slru(trace: impl IntoIterator<Item = u64>, maximum_size: usize) -> PolicyStats {
+    let protected_limit = maximum_size * 4 / 5;
+    let probation_limit = maximum_size - protected_limit;
+    let mut probation: HashMap<u64, u64> = HashMap::new();
+    let mut protected: HashMap<u64, u64> = HashMap::new();
+    let mut probation_order = BinaryHeap::new();
+    let mut protected_order = BinaryHeap::new();
+    let mut tick = 0u64;
+    let mut stats = PolicyStats::default();
+
+    for key in trace {
+        tick += 1;
+        if let Some(last) = protected.get_mut(&key) {
+            *last = tick;
+            protected_order.push(Reverse((tick, key)));
+            stats.hits += 1;
+            continue;
+        }
+        if probation.remove(&key).is_some() {
+            stats.hits += 1;
+            protected.insert(key, tick);
+            protected_order.push(Reverse((tick, key)));
+            if protected.len() > protected_limit {
+                if let Some(victim) = pop_lru(&mut protected_order, &protected) {
+                    protected.remove(&victim);
+                    probation.insert(victim, tick);
+                    probation_order.push(Reverse((tick, victim)));
+                    if probation.len() > probation_limit {
+                        if let Some(evicted) = pop_lru(&mut probation_order, &probation) {
+                            probation.remove(&evicted);
+                            stats.evictions += 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        stats.misses += 1;
+        if maximum_size == 0 {
+            stats.evictions += 1;
+            continue;
+        }
+        probation.insert(key, tick);
+        probation_order.push(Reverse((tick, key)));
+        if probation.len() > probation_limit {
+            if let Some(evicted) = pop_lru(&mut probation_order, &probation) {
+                probation.remove(&evicted);
+                stats.evictions += 1;
+            }
+        }
+    }
+    stats
+}
+
+fn pop_lru(
+    order: &mut BinaryHeap<Reverse<(u64, u64)>>,
+    entries: &HashMap<u64, u64>,
+) -> Option<u64> {
+    while let Some(Reverse((tick, key))) = order.pop() {
+        if entries.get(&key) == Some(&tick) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+fn simulate_clock(trace: impl IntoIterator<Item = u64>, maximum_size: usize) -> PolicyStats {
+    struct Slot {
+        key: u64,
+        referenced: bool,
+    }
+
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut positions: HashMap<u64, usize> = HashMap::new();
+    let mut hand = 0usize;
+    let mut stats = PolicyStats::default();
+
+    for key in trace {
+        if let Some(&index) = positions.get(&key) {
+            slots[index].referenced = true;
+            stats.hits += 1;
+            continue;
+        }
+        stats.misses += 1;
+        if maximum_size == 0 {
+            stats.evictions += 1;
+            continue;
+        }
+        if slots.len() < maximum_size {
+            positions.insert(key, slots.len());
+            slots.push(Slot {
+                key,
+                referenced: true,
+            });
+            continue;
+        }
+        loop {
+            let index = hand;
+            hand = (hand + 1) % slots.len();
+            if slots[index].referenced {
+                slots[index].referenced = false;
+            } else {
+                positions.remove(&slots[index].key);
+                positions.insert(key, index);
+                slots[index] = Slot {
+                    key,
+                    referenced: true,
+                };
+                stats.evictions += 1;
+                break;
+            }
+        }
+    }
+    stats
+}
+
+fn simulate_optimal(trace: impl IntoIterator<Item = u64>, maximum_size: usize) -> PolicyStats {
+    let trace: Vec<u64> = trace.into_iter().collect();
+    let mut future: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    for (index, &key) in trace.iter().enumerate() {
+        future.entry(key).or_default().push_back(index);
+    }
+    let mut cached = HashSet::new();
+    let mut stats = PolicyStats::default();
+
+    for (index, &key) in trace.iter().enumerate() {
+        if let Some(queue) = future.get_mut(&key) {
+            if queue.front() == Some(&index) {
+                queue.pop_front();
+            }
+        }
+        if cached.contains(&key) {
+            stats.hits += 1;
+            continue;
+        }
+        stats.misses += 1;
+        if maximum_size == 0 {
+            stats.evictions += 1;
+            continue;
+        }
+        if cached.len() >= maximum_size {
+            let victim = cached
+                .iter()
+                .max_by_key(|candidate| {
+                    future
+                        .get(candidate)
+                        .and_then(|queue| queue.front().copied())
+                        .unwrap_or(usize::MAX)
+                })
+                .copied();
+            if let Some(victim) = victim {
+                cached.remove(&victim);
+                stats.evictions += 1;
+            }
+        }
+        cached.insert(key);
     }
     stats
 }
@@ -255,5 +454,40 @@ mod tests {
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 3);
         assert_eq!(stats.evictions, 3);
+    }
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+
+    #[test]
+    fn classic_policies_replay_the_same_trace() {
+        let fifo = simulate([1, 2, 1, 3, 1], Policy::Fifo, 2);
+        assert_eq!(fifo.request_count(), 5);
+        assert_eq!(fifo.hits, 1);
+        assert_eq!(fifo.evictions, 2);
+
+        let clock = simulate([1, 2, 1, 3, 1], Policy::Clock, 2);
+        assert_eq!(clock.request_count(), 5);
+        assert_eq!(clock.hits, 1);
+
+        let slru = simulate([1, 2, 1, 3, 1], Policy::Slru, 2);
+        assert_eq!(slru.request_count(), 5);
+
+        let optimal = simulate([1, 2, 3, 1, 2, 4, 1, 2, 3, 4], Policy::Optimal, 3);
+        assert_eq!(optimal.request_count(), 10);
+        assert_eq!(optimal.hits, 5);
+        assert_eq!(optimal.evictions, 2);
+    }
+
+    #[test]
+    fn zero_capacity_never_hits_for_new_policies() {
+        for policy in [Policy::Fifo, Policy::Slru, Policy::Clock, Policy::Optimal] {
+            let stats = simulate([1, 2, 3], policy, 0);
+            assert_eq!(stats.hits, 0);
+            assert_eq!(stats.misses, 3);
+            assert_eq!(stats.evictions, 3);
+        }
     }
 }
