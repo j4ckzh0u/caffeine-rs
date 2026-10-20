@@ -1,0 +1,20 @@
+[package]
+name = "caffeine-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["j4ckzh0u"]
+description = "A high-performance, near-optimal in-memory cache for Rust, inspired by Caffeine"
+license = "Apache-2.0"
+repository = "https://github.com/j4ckzh0u/caffeine-rs"
+readme = "README.md"
+keywords = ["cache", "lru", "tinylfu", "concurrent", "caffeine"]
+categories = ["caching", "concurrency"]
+
+[lib]
+name = "caffeine"
+path = "src/lib.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
