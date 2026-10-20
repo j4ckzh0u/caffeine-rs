@@ -215,15 +215,18 @@ where
 
     /// Builds an asynchronous loading cache, mirroring
     /// `Caffeine.buildAsync(CacheLoader)`.
-    pub fn build_async_with_loader<F, Fut>(self, loader: F) -> AsyncLoadingCache<K, V>
+    pub fn build_async_with_loader<F, Fut>(mut self, loader: F) -> AsyncLoadingCache<K, V>
     where
         F: Fn(K) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = V> + Send + 'static,
     {
-        if self.refresh_after_write.is_some() {
-            panic!("refresh_after_write requires build_with_loader, not an async loader");
+        let refresh = self.refresh_after_write.take();
+        let cache = self.build();
+        let loading = AsyncLoadingCache::new(cache, move |key| Box::pin(loader(key)));
+        match refresh {
+            Some(duration) => loading.with_refresh_after_write(duration),
+            None => loading,
         }
-        AsyncLoadingCache::new(self.build(), move |key| Box::pin(loader(key)))
     }
 
     fn finish(self) -> Cache<K, V> {

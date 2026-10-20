@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Compares the Java Caffeine and Rust caffeine-rs workload results."""
+"""Compares the Java Caffeine and Rust caffeine-rs workload results.
+
+Both harnesses emit one `hits misses evictions` line per trial with a fresh
+cache/hash seed. Comparing aggregate rates over multiple trials removes the
+run-to-run variance caused by randomized frequency-sketch hashing.
+"""
 
 import sys
 
@@ -9,18 +14,34 @@ MAX_EVICTION_DELTA = 0.10
 
 def parse(path):
     with open(path, encoding="utf-8") as handle:
-        parts = handle.read().split()
-    if len(parts) != 3:
-        raise SystemExit(f"{path}: expected 3 integers, got {parts!r}")
-    return tuple(int(part) for part in parts)
+        lines = [line.split() for line in handle if line.strip()]
+    if not lines:
+        raise SystemExit(f"{path}: no trial results")
+    trials = []
+    for parts in lines:
+        if len(parts) != 3:
+            raise SystemExit(f"{path}: expected 3 integers, got {parts!r}")
+        trials.append(tuple(int(part) for part in parts))
+    return trials
+
+
+def aggregate(trials):
+    return tuple(sum(values) for values in zip(*trials))
 
 
 def main():
     if len(sys.argv) != 3:
         raise SystemExit("usage: compare.py <java-output> <rust-output>")
 
-    java_hits, java_misses, java_evictions = parse(sys.argv[1])
-    rust_hits, rust_misses, rust_evictions = parse(sys.argv[2])
+    java_trials = parse(sys.argv[1])
+    rust_trials = parse(sys.argv[2])
+    if len(java_trials) != len(rust_trials):
+        raise SystemExit(
+            f"trial count mismatch: java={len(java_trials)} rust={len(rust_trials)}"
+        )
+
+    java_hits, java_misses, java_evictions = aggregate(java_trials)
+    rust_hits, rust_misses, rust_evictions = aggregate(rust_trials)
 
     java_total = java_hits + java_misses
     rust_total = rust_hits + rust_misses
@@ -37,13 +58,13 @@ def main():
     )
 
     print(
-        "java: hits={} misses={} evictions={} hit_rate={:.4f}".format(
-            java_hits, java_misses, java_evictions, java_rate
+        "java: trials={} hits={} misses={} evictions={} hit_rate={:.4f}".format(
+            len(java_trials), java_hits, java_misses, java_evictions, java_rate
         )
     )
     print(
-        "rust: hits={} misses={} evictions={} hit_rate={:.4f}".format(
-            rust_hits, rust_misses, rust_evictions, rust_rate
+        "rust: trials={} hits={} misses={} evictions={} hit_rate={:.4f}".format(
+            len(rust_trials), rust_hits, rust_misses, rust_evictions, rust_rate
         )
     )
 

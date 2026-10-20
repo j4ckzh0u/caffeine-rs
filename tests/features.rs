@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caffeine::guava::GuavaCache;
 use caffeine::jcache::{CachingProvider, Configuration};
@@ -439,4 +439,33 @@ fn async_cache_bulk_get_uses_mapping() {
     }));
     assert_eq!(values.len(), 2);
     assert_eq!(values.get(&2), Some(&40));
+}
+
+#[test]
+fn async_loading_cache_refreshes_in_the_background() {
+    let now = Arc::new(AtomicU64::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let loading = Cache::builder()
+        .maximum_size(10)
+        .ticker(FakeTicker(Arc::clone(&now)))
+        .refresh_after_write(Duration::from_secs(10))
+        .build_async_with_loader(move |key: u64| {
+            let call = counted.fetch_add(1, Ordering::Relaxed) + 1;
+            async move { key * 100 + call as u64 }
+        });
+
+    assert_eq!(block_on(loading.get(1)), 101);
+    now.store(11_000_000_000, Ordering::Relaxed);
+    let _ = block_on(loading.get(1));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while calls.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert!(calls.load(Ordering::Relaxed) >= 2);
+    while loading.synchronous().get(&1) != Some(102) && Instant::now() < deadline {
+        thread::yield_now();
+    }
+    assert_eq!(loading.synchronous().get(&1), Some(102));
 }

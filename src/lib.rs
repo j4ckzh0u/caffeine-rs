@@ -32,6 +32,7 @@
 //! - Adaptive admission window: reactive hill climbing up to 4096 entries,
 //!   density feedback with probes and audits above it
 //! - Asynchronous refresh after write, with one in-flight refresh per key
+//!   for both synchronous and asynchronous loading caches
 //! - Removal and eviction listeners, with removal causes
 //! - Hit, miss, load, and eviction statistics
 //! - Policy views for eviction, fixed and variable expiration, and refresh

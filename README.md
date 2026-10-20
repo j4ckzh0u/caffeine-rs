@@ -296,7 +296,9 @@ let loading = caffeine::Cache::builder()
 ```
 
 `AsyncLoadingCache::get_all` loads every requested key; `AsyncCache::put_all`
-and `as_map` complete the map-shaped surface.
+and `as_map` complete the map-shaped surface. Async loading caches also honor
+`refresh_after_write`: a stale read returns the old value and one background
+thread per key reloads it, coalescing concurrent stale reads.
 
 ### Policy inspection
 
@@ -351,10 +353,10 @@ this crate, not binary-compatible with the Java libraries.
 
 `examples/equivalence_trace.rs` and
 `tools/equivalence/CaffeineEquivalence.java` replay the same 200,000-access
-synthetic trace through this crate and through Java Caffeine 3.3.1. CI runs
-both and compares hit rate and eviction counts with bounded tolerances (2% and
-10%), guarding against policy drift while allowing for different hash seeds
-and sketch indexing.
+synthetic trace five times with a fresh cache per trial. CI aggregates the
+trials and compares hit rate and eviction counts with bounded tolerances (2%
+and 10%), guarding against policy drift while smoothing the randomized
+frequency-sketch hashing used by both implementations.
 
 ## Architecture
 

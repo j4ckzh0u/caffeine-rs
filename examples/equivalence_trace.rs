@@ -1,14 +1,16 @@
 //! Replays the deterministic workload used by the Java Caffeine harness in
 //! `tools/equivalence/CaffeineEquivalence.java`.
 //!
-//! Output: `hits misses evictions` separated by spaces.
+//! Each trial uses a fresh cache (and therefore a fresh hash seed). Output is
+//! one `hits misses evictions` line per trial.
 
 use caffeine::Cache;
 
 const CAPACITY: usize = 2_000;
 const ACCESSES: usize = 200_000;
+const TRIALS: usize = 5;
 
-fn main() {
+fn run() -> (u64, u64, u64) {
     let cache: Cache<u64, u64> = Cache::builder()
         .maximum_size(CAPACITY)
         .record_stats(true)
@@ -28,8 +30,12 @@ fn main() {
     }
 
     let stats = cache.stats();
-    println!(
-        "{} {} {}",
-        stats.hit_count, stats.miss_count, stats.eviction_count
-    );
+    (stats.hit_count, stats.miss_count, stats.eviction_count)
+}
+
+fn main() {
+    for _ in 0..TRIALS {
+        let (hits, misses, evictions) = run();
+        println!("{hits} {misses} {evictions}");
+    }
 }

@@ -6,13 +6,21 @@ import com.github.benmanes.caffeine.cache.stats.CacheStats;
  * Replays the deterministic workload used by
  * {@code examples/equivalence_trace.rs} through Java Caffeine.
  *
- * <p>Output: {@code hits misses evictions} separated by spaces.
+ * <p>Each trial uses a fresh cache (and therefore a fresh hash seed). Output is
+ * one {@code hits misses evictions} line per trial.
  */
 public final class CaffeineEquivalence {
   private static final int CAPACITY = 2_000;
   private static final int ACCESSES = 200_000;
+  private static final int TRIALS = 5;
 
   public static void main(String[] args) {
+    for (int trial = 0; trial < TRIALS; trial++) {
+      runTrial();
+    }
+  }
+
+  private static void runTrial() {
     Cache<Long, Long> cache = Caffeine.newBuilder()
         .maximumSize(CAPACITY)
         .recordStats()

@@ -10,14 +10,14 @@
 //! The synchronous cache remains available through
 //! [`AsyncCache::synchronous`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, ThreadId};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cache::{Cache, CacheMap, Policy};
 use crate::stats::CacheStats;
@@ -325,6 +325,8 @@ where
 pub struct AsyncLoadingCache<K, V> {
     cache: AsyncCache<K, V>,
     loader: Arc<dyn Fn(K) -> BoxFuture<V> + Send + Sync + 'static>,
+    refresh_after_write: Option<Duration>,
+    refreshes: Arc<Mutex<HashSet<K>>>,
 }
 
 impl<K, V> Clone for AsyncLoadingCache<K, V> {
@@ -332,6 +334,8 @@ impl<K, V> Clone for AsyncLoadingCache<K, V> {
         Self {
             cache: self.cache.clone(),
             loader: Arc::clone(&self.loader),
+            refresh_after_write: self.refresh_after_write,
+            refreshes: Arc::clone(&self.refreshes),
         }
     }
 }
@@ -349,13 +353,62 @@ where
         Self {
             cache: AsyncCache::new(cache),
             loader: Arc::new(loader),
+            refresh_after_write: None,
+            refreshes: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Refreshes entries in the background after they have not been written
+    /// for `duration`.
+    pub fn with_refresh_after_write(mut self, duration: Duration) -> Self {
+        self.refresh_after_write = Some(duration);
+        self
     }
 
     /// Returns the cached value, loading it on a miss.
     pub async fn get(&self, key: K) -> V {
         let loader = Arc::clone(&self.loader);
-        self.cache.get_with_async(key, move |key| loader(key)).await
+        let value = self
+            .cache
+            .get_with_async(key.clone(), move |key| loader(key))
+            .await;
+        self.refresh_if_stale(&key);
+        value
+    }
+
+    fn refresh_if_stale(&self, key: &K) {
+        let Some(ttl) = self.refresh_after_write else {
+            return;
+        };
+        let age = self.cache.synchronous().age_of(key, false);
+        if age.map_or(true, |age| age < ttl) {
+            return;
+        }
+        if !lock(&self.refreshes).insert(key.clone()) {
+            return;
+        }
+
+        let loader = Arc::clone(&self.loader);
+        let cache = self.cache.synchronous().clone();
+        let pending = Arc::clone(&self.refreshes);
+        let load_key = key.clone();
+        let tracked_key = key.clone();
+        let spawned = thread::Builder::new()
+            .name("caffeine-async-refresh".to_string())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    block_on(loader(load_key))
+                }));
+                if let Ok(value) = outcome {
+                    if cache.contains_key(&tracked_key) {
+                        cache.insert(tracked_key.clone(), value);
+                    }
+                }
+                lock(&pending).remove(&tracked_key);
+            });
+        if spawned.is_err() {
+            lock(&self.refreshes).remove(key);
+        }
     }
 
     /// Returns every requested key, loading missing values one at a time.
@@ -538,6 +591,26 @@ where
             for waker in state.1.drain(..) {
                 waker.wake();
             }
+        }
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    struct ThreadWaker(thread::Thread);
+
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let mut future = Box::pin(future);
+    let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
+    let mut context = Context::from_waker(&waker);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => thread::park(),
         }
     }
 }
