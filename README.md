@@ -3,8 +3,8 @@
 [![CI](https://github.com/j4ckzh0u/caffeine-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/j4ckzh0u/caffeine-rs/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A high-performance, near-optimal in-memory cache for Rust, inspired by
-[Ben Manes' Caffeine](https://github.com/ben-manes/caffeine).
+A high-performance, near-optimal in-memory cache for Rust, a functional Rust
+port of [Ben Manes' Caffeine](https://github.com/ben-manes/caffeine).
 
 The eviction policy is **Window TinyLFU (W-TinyLFU)**: a small admission LRU
 window backed by a segmented LRU main space, with a 4-bit Count-Min sketch
@@ -50,13 +50,16 @@ cargo run --example basic
 | Refresh after write | ✅ | async, one in-flight refresh per key |
 | Automatic loading | ✅ | `get_with` / `try_get_with` / `build_with_loader` |
 | Removal listener | ✅ | synchronous, gets the `RemovalCause` |
-| Eviction listener | ✅ | size/weight and expiration removals |
+| Eviction listener | ✅ | size/weight, expiration, and collected removals |
 | Statistics | ✅ | hits, misses, loads, load time, evictions |
+| Policy inspection and resizing | ✅ | eviction, expiration, and refresh views |
 | Custom ticker | ✅ | deterministic time in tests |
 | Custom executor | ✅ | drives refresh tasks |
-| Weak / soft references | N/A | Java GC features; store `Weak` / `Arc` explicitly |
-| Async cache views | N/A | Java `CompletableFuture` adapters; the sync cache is usable from any runtime |
-| JCache / Guava / simulator modules | N/A | Java-platform integrations without a Rust counterpart |
+| Weak / soft references | ✅ | `ReferenceCache`: weak/soft values, identity weak keys |
+| Async cache views | ✅ | `AsyncCache` / `AsyncLoadingCache` async methods |
+| Guava adapter | ✅ | `guava` module: Guava-shaped builder and cache |
+| JCache adapter | ✅ | `jcache` module: JSR-107-shaped provider, manager, cache |
+| Simulator | ✅ | trace replay for W-TinyLFU, LRU, and LFU |
 
 ## Usage
 
@@ -219,6 +222,111 @@ assert!(!policy.is_weighted());
 assert_eq!(policy.estimated_size(), 0);
 ```
 
+### Weak and soft references
+
+`ReferenceCache` mirrors Caffeine's `weakKeys`, `weakValues`, and
+`softValues`. Insert and look up entries with `Arc` handles; the cache stores
+`Weak` handles internally when the corresponding strength is weak or soft.
+
+```rust
+use caffeine::ReferenceCache;
+use std::sync::Arc;
+
+let cache: ReferenceCache<u64, String> = ReferenceCache::builder()
+    .maximum_size(10_000)
+    .weak_values()
+    .build();
+
+let value = Arc::new("payload".to_string());
+cache.insert(Arc::new(7), Arc::clone(&value));
+assert_eq!(cache.get(&Arc::new(7)).as_deref(), Some(&"payload".to_string()));
+
+drop(value);
+cache.clean_up(); // purges collected entries with RemovalCause::Collected
+assert!(cache.get(&Arc::new(7)).is_none());
+```
+
+Weak keys compare by pointer identity, like Caffeine's `weakKeys`. Rust has no
+tracing collector and no soft references, so dead entries are purged on access
+or during `clean_up`; `soft_values()` is the explicit memory-pressure hook.
+Removal listeners fire only when the key and value can still be upgraded.
+
+### Asynchronous cache views
+
+`AsyncCache` and `AsyncLoadingCache` mirror Caffeine's async views with Rust
+`async` methods instead of `CompletableFuture`.
+
+```rust
+use caffeine::{AsyncCache, Cache};
+
+let cache: Cache<u64, u64> = Cache::builder().maximum_size(10_000).build();
+let async_cache = AsyncCache::new(cache);
+
+let value = async_cache
+    .get_with_async(42, |key| async move { key * 2 })
+    .await;
+assert_eq!(value, 84);
+```
+
+Concurrent misses for one key are coalesced: the first caller runs the
+initializer and the others await its result. Cancellation, failure, or a panic
+wakes the waiters and lets one of them retry; a failed load is never shared.
+`AsyncLoadingCache::new(cache, loader)` installs a boxed async loader.
+
+### Policy inspection
+
+The policy views mirror Caffeine's `Policy` hierarchy.
+
+```rust
+use std::time::Duration;
+
+let cache: caffeine::Cache<u64, u64> = caffeine::Cache::builder()
+    .maximum_size(1_000)
+    .expire_after_access(Duration::from_secs(30))
+    .build();
+
+let eviction = cache.policy().eviction().unwrap();
+eviction.set_maximum(500);          // eagerly evicts the excess
+let coldest = eviction.coldest(10);
+let hottest = eviction.hottest(10);
+
+let expiration = cache.policy().expire_after_access().unwrap();
+expiration.set_expires_after(Duration::from_secs(60));
+```
+
+`expire_after_write()` returns the TTL view, `expire_variably()` returns the
+per-entry view (`put`, `put_if_absent`, `set_expires_after`, `oldest`,
+`youngest`), and `refresh_after_write()` exposes refresh aging and updates.
+`get_if_present_quietly()` reads without recording statistics.
+
+### Simulator
+
+The `simulator` module replays access traces against this crate's W-TinyLFU
+policy or reference LRU/LFU implementations:
+
+```rust
+use caffeine::simulator::{simulate, Policy};
+
+let stats = simulate([1, 2, 1, 3, 1], Policy::Wtinylfu, 2);
+println!("hit rate {:.2}", stats.hit_rate());
+```
+
+### Guava and JCache adapters
+
+The `guava` module provides a Guava-shaped builder and cache, and the `jcache`
+module provides a JSR-107-shaped provider, manager, configuration, and cache.
+They are Rust API-shape adapters over this crate, not binary-compatible with
+the Java libraries.
+
+## Equivalence with Java Caffeine
+
+`examples/equivalence_trace.rs` and
+`tools/equivalence/CaffeineEquivalence.java` replay the same 200,000-access
+synthetic trace through this crate and through Java Caffeine 3.3.1. CI runs
+both and compares hit rate and eviction counts with bounded tolerances (2% and
+10%), guarding against policy drift while allowing for different hash seeds
+and sketch indexing.
+
 ## Architecture
 
 ```text
@@ -257,11 +365,13 @@ and transfers main-space entries into the window; shrinking reverses the
 transfer. A single global climber drives the whole cache.
 
 **One global policy.** Caffeine applies one admission window, one segmented
-main space, and one frequency sketch across the entire cache; only its hash
-table is striped. This crate preserves that exactly by holding the policy
-under one lock. Reads and writes therefore serialize, trading some
-multi-core throughput for policy fidelity. Listeners, loaders, and refresh
-tasks still run outside the lock.
+main space, and one frequency sketch across the entire cache; its policy state
+sits behind a single eviction lock. This crate keeps that same global policy
+under one mutex, so admission and eviction decisions match. The internal
+concurrency architecture differs — Caffeine stripes its hash table and buffers
+reads for higher multi-core throughput — which is a performance characteristic,
+not a policy difference. Listeners, loaders, and refresh tasks run outside the
+lock.
 
 **Why no `unsafe`?** Nodes live in a slab (`Vec<Option<Box<Node>>>`) addressed
 by `u32` ids, and LRU lists are intrusive `prev`/`next` indices. No raw
@@ -293,12 +403,14 @@ The suite covers eviction bounds, scan resistance, TTL and idle expiration,
 both fixed TTLs at once, variable per-entry expiry, reactive and density
 window adaptation, coalesced concurrent loads, refresh coalescing and failure
 recovery, listeners and causes, statistics, weighted eviction, zero-weight
-entries, loading, iterator/retain behavior, builder validation, and
-multi-threaded stress. Time-dependent tests use a fake `Ticker`; refresh tests
-use a queue `Executor`, so no sleeps are required.
+entries, loading, iterator/retain behavior, builder validation, policy views
+and resizing, weak/soft reference collection, async loading and retry,
+simulator policies, the Guava/JCache adapters, and multi-threaded stress.
+Time-dependent tests use a fake `Ticker`; async tests use a small `block_on`
+helper and refresh tests use a queue `Executor`, so no sleeps are required.
 
 CI runs on GitHub Actions across every push and pull request, including an
-MSRV (Rust 1.75) check.
+MSRV (Rust 1.75) check and the differential Java Caffeine job.
 
 ## License
 

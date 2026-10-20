@@ -329,8 +329,38 @@ where
         self.insert(key, value);
     }
 
+    /// Inserts only when the key is absent, returning the existing value
+    /// otherwise. The check and insert happen under one shard lock.
+    pub fn put_if_absent(&self, key: K, value: V) -> Option<V> {
+        let now = self.now();
+        let hash = self.hash_key(&key);
+        let weight = self.inner.config.weight(&key, &value);
+        let shard_index = self.shard_index(hash);
+        let mut removed = Vec::new();
+        let previous = {
+            let mut shard = lock(&self.inner.shards[shard_index]);
+            match shard.peek(&key, now, &mut removed) {
+                Some(existing) => Some(existing),
+                None => {
+                    shard.insert(key, value, hash, weight, now, &mut removed);
+                    None
+                }
+            }
+        };
+        self.notify(removed);
+        previous
+    }
+
     /// Removes an entry, returning its value if it was present.
     pub fn invalidate<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.remove_with_cause(key, RemovalCause::Explicit)
+    }
+
+    pub(crate) fn remove_with_cause<Q>(&self, key: &Q, cause: RemovalCause) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -341,7 +371,7 @@ where
         let mut removed = Vec::new();
         let value = {
             let mut shard = lock(&self.inner.shards[shard_index]);
-            shard.remove(key, RemovalCause::Explicit, now, &mut removed)
+            shard.remove(key, cause, now, &mut removed)
         };
         self.notify(removed);
         value
@@ -447,6 +477,148 @@ where
     /// Returns a view of the cache's configuration and current policy size.
     pub fn policy(&self) -> Policy<'_, K, V> {
         Policy { cache: self }
+    }
+
+    /// Returns `true` when statistics collection is enabled.
+    pub fn is_recording_stats(&self) -> bool {
+        self.inner.config.record_stats
+    }
+
+    /// Returns the value without recording a hit or miss.
+    pub fn peek_quietly<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.peek(key)
+    }
+
+    /// Clones every live key.
+    pub fn keys(&self) -> Vec<K> {
+        self.iter().map(|(key, _)| key).collect()
+    }
+
+    /// Returns the weight of an entry when the cache is weighted.
+    pub fn weight_of<Q>(&self, key: &Q) -> Option<u32>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        lock(&self.inner.shards[shard_index]).weight_of(key, now)
+    }
+
+    /// Changes the maximum size or weight and eagerly evicts any excess.
+    pub fn set_maximum(&self, maximum: u64) {
+        let mut removed = Vec::new();
+        for shard in self.inner.shards.iter() {
+            lock(shard).set_maximum(maximum, &mut removed);
+        }
+        self.notify(removed);
+    }
+
+    /// Snapshot ordered from least to most likely to be retained.
+    pub fn coldest(&self, limit: usize) -> Vec<(K, V)> {
+        lock(&self.inner.shards[0]).coldest(limit)
+    }
+
+    /// Snapshot ordered from most to least likely to be retained.
+    pub fn hottest(&self, limit: usize) -> Vec<(K, V)> {
+        lock(&self.inner.shards[0]).hottest(limit)
+    }
+
+    /// Time since the entry's last access or write.
+    pub fn age_of<Q>(&self, key: &Q, access: bool) -> Option<Duration>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        lock(&self.inner.shards[shard_index])
+            .age_of(key, now, access)
+            .map(Duration::from_nanos)
+    }
+
+    /// Absolute expiration deadline in ticker nanoseconds.
+    pub fn expires_at<Q>(&self, key: &Q) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        lock(&self.inner.shards[shard_index]).expires_at(key, now)
+    }
+
+    /// Remaining lifetime before expiry.
+    pub fn remaining_duration<Q>(&self, key: &Q) -> Option<Duration>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        self.expires_at(key)
+            .map(|at| Duration::from_nanos(at.saturating_sub(now)))
+    }
+
+    /// Absolute time at which an entry becomes refreshable.
+    pub fn refreshable_at<Q>(&self, key: &Q) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let ttl = self.inner.config.refresh_ttl()?;
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        lock(&self.inner.shards[shard_index]).refreshable_at(key, now, ttl)
+    }
+
+    /// Keys with a refresh currently in flight.
+    pub fn refreshing_keys(&self) -> Vec<K> {
+        lock(&self.inner.shards[0]).refreshing_keys()
+    }
+
+    pub(crate) fn fixed_expiration(&self, access: bool) -> Option<u64> {
+        let shard = lock(&self.inner.shards[0]);
+        if access {
+            shard.fixed_access()
+        } else {
+            shard.fixed_write()
+        }
+    }
+
+    pub(crate) fn set_fixed_expiration(&self, access: bool, duration: u64) {
+        let now = self.now();
+        let mut removed = Vec::new();
+        lock(&self.inner.shards[0]).set_fixed_duration(access, duration, now, &mut removed);
+        self.notify(removed);
+    }
+
+    pub(crate) fn set_variable_expiry<Q>(&self, key: &Q, duration: u64)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let now = self.now();
+        let hash = self.hash_key(key);
+        let shard_index = self.shard_index(hash);
+        let mut removed = Vec::new();
+        lock(&self.inner.shards[shard_index]).set_expiry(key, now, duration, &mut removed);
+        self.notify(removed);
+    }
+
+    pub(crate) fn order_by_time(&self, access: bool, oldest: bool, limit: usize) -> Vec<(K, V)> {
+        lock(&self.inner.shards[0]).order_by_time(access, oldest, limit)
+    }
+
+    pub(crate) fn order_by_expiry(&self, oldest: bool, limit: usize) -> Vec<(K, V)> {
+        lock(&self.inner.shards[0]).order_by_expiry(oldest, limit)
     }
 
     /// Marks an entry for asynchronous refresh if a loader is configured.
@@ -560,6 +732,14 @@ where
         }
     }
 
+    pub(crate) fn note_load_success(&self, started: Instant) {
+        self.record_load_success(started);
+    }
+
+    pub(crate) fn note_load_failure(&self, started: Instant) {
+        self.record_load_failure(started);
+    }
+
     fn record_load_success(&self, started: Instant) {
         if self.inner.config.record_stats {
             self.inner
@@ -594,7 +774,8 @@ where
     }
 }
 
-/// A read-only view of the cache's eviction and expiration configuration.
+/// A read-only view of the cache's eviction and expiration configuration,
+/// mirroring Caffeine's `Policy`.
 pub struct Policy<'a, K, V> {
     cache: &'a Cache<K, V>,
 }
@@ -607,7 +788,7 @@ where
     /// Maximum number of entries, or maximum total weight when weighted.
     /// Unbounded caches report a very large sentinel value.
     pub fn maximum(&self) -> u64 {
-        self.cache.inner.config.max_capacity
+        lock(&self.cache.inner.shards[0]).maximum()
     }
 
     /// Returns `true` when eviction is driven by weights rather than entries.
@@ -625,30 +806,68 @@ where
         self.cache.len()
     }
 
-    /// Configured time-to-idle for fixed expiration policies.
-    ///
-    /// Returns `None` for a custom [`Expiry`](crate::Expiry); see
-    /// [`is_variable_expiration`](Self::is_variable_expiration).
-    pub fn expire_after_access(&self) -> Option<Duration> {
-        self.cache
-            .inner
-            .config
-            .expiration
-            .fixed_access()
-            .map(Duration::from_nanos)
+    /// Returns `true` when statistics are being recorded.
+    pub fn is_recording_stats(&self) -> bool {
+        self.cache.is_recording_stats()
     }
 
-    /// Configured time-to-live for fixed expiration policies.
-    ///
-    /// Returns `None` for a custom [`Expiry`](crate::Expiry); see
-    /// [`is_variable_expiration`](Self::is_variable_expiration).
-    pub fn expire_after_write(&self) -> Option<Duration> {
+    /// Keys with a refresh in flight.
+    pub fn refreshes(&self) -> Vec<K> {
+        self.cache.refreshing_keys()
+    }
+
+    /// Returns the eviction policy view when the cache is bounded.
+    pub fn eviction(&self) -> Option<Eviction<'_, K, V>> {
         self.cache
             .inner
             .config
-            .expiration
-            .fixed_write()
-            .map(Duration::from_nanos)
+            .bounded
+            .then_some(Eviction { cache: self.cache })
+    }
+
+    /// Returns the fixed time-to-idle policy when configured.
+    pub fn expire_after_access(&self) -> Option<FixedExpiration<'_, K, V>> {
+        self.cache.fixed_expiration(true).map(|_| FixedExpiration {
+            cache: self.cache,
+            access: true,
+        })
+    }
+
+    /// Returns the fixed time-to-live policy when configured.
+    pub fn expire_after_write(&self) -> Option<FixedExpiration<'_, K, V>> {
+        self.cache.fixed_expiration(false).map(|_| FixedExpiration {
+            cache: self.cache,
+            access: false,
+        })
+    }
+
+    /// Returns the per-entry expiration view when a custom `Expiry` is used.
+    pub fn expire_variably(&self) -> Option<VarExpiration<'_, K, V>> {
+        self.is_variable_expiration()
+            .then_some(VarExpiration { cache: self.cache })
+    }
+
+    /// Returns the refresh-after-write policy when configured.
+    pub fn refresh_after_write(&self) -> Option<FixedRefresh<'_, K, V>> {
+        self.cache
+            .inner
+            .config
+            .refresh_ttl()
+            .map(|_| FixedRefresh { cache: self.cache })
+    }
+
+    /// Returns the value without recording a hit or miss.
+    pub fn get_if_present_quietly<Q>(&self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.peek(key)
+    }
+
+    /// Clones every live key.
+    pub fn keys(&self) -> Vec<K> {
+        self.cache.keys()
     }
 
     /// Returns `true` when a custom per-entry [`Expiry`](crate::Expiry) is in
@@ -657,7 +876,7 @@ where
         self.cache.inner.config.expiration.is_custom()
     }
 
-    /// Current admission window size, summed across shards.
+    /// Current admission window size.
     pub fn window_maximum(&self) -> u64 {
         self.cache
             .inner
@@ -666,14 +885,209 @@ where
             .map(|shard| lock(shard).window_maximum())
             .sum()
     }
+}
 
+/// The size- or weight-bounded eviction policy view.
+pub struct Eviction<'a, K, V> {
+    cache: &'a Cache<K, V>,
+}
+
+impl<K, V> Eviction<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Returns `true` when the bound is measured in weight.
+    pub fn is_weighted(&self) -> bool {
+        self.cache.inner.config.is_weighted
+    }
+
+    /// Weight of a live entry, when the cache is weighted.
+    pub fn weight_of<Q>(&self, key: &Q) -> Option<u32>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.is_weighted() {
+            return None;
+        }
+        self.cache.weight_of(key)
+    }
+
+    /// Accumulated weight, when the cache is weighted.
+    pub fn weighted_size(&self) -> Option<u64> {
+        self.is_weighted().then(|| self.cache.weighted_size())
+    }
+
+    /// Current maximum size or weight.
+    pub fn maximum(&self) -> u64 {
+        lock(&self.cache.inner.shards[0]).maximum()
+    }
+
+    /// Changes the maximum and eagerly evicts entries above it.
+    pub fn set_maximum(&self, maximum: u64) {
+        self.cache.set_maximum(maximum);
+    }
+
+    /// Snapshot from least to most likely to be retained.
+    pub fn coldest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.coldest(limit)
+    }
+
+    /// Snapshot from most to least likely to be retained.
+    pub fn hottest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.hottest(limit)
+    }
+}
+
+/// A fixed time-to-idle or time-to-live expiration policy view.
+pub struct FixedExpiration<'a, K, V> {
+    cache: &'a Cache<K, V>,
+    access: bool,
+}
+
+impl<K, V> FixedExpiration<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Configured duration.
+    pub fn expires_after(&self) -> Duration {
+        self.cache
+            .fixed_expiration(self.access)
+            .map(Duration::from_nanos)
+            .unwrap_or_default()
+    }
+
+    /// Changes the duration for every entry and recomputes deadlines.
+    pub fn set_expires_after(&self, duration: Duration) {
+        self.cache
+            .set_fixed_expiration(self.access, crate::ticker::nanos(duration));
+    }
+
+    /// Time since the entry's last access (idle) or write (TTL).
+    pub fn age_of<Q>(&self, key: &Q) -> Option<Duration>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.age_of(key, self.access)
+    }
+
+    /// Oldest live entries under this policy.
+    pub fn oldest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_time(self.access, true, limit)
+    }
+
+    /// Youngest live entries under this policy.
+    pub fn youngest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_time(self.access, false, limit)
+    }
+}
+
+/// The per-entry expiration policy view for a custom `Expiry`.
+pub struct VarExpiration<'a, K, V> {
+    cache: &'a Cache<K, V>,
+}
+
+impl<K, V> VarExpiration<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Remaining lifetime of an entry.
+    pub fn get_expires_after<Q>(&self, key: &Q) -> Option<Duration>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.remaining_duration(key)
+    }
+
+    /// Resets an entry's lifetime to `duration` from now.
+    pub fn set_expires_after<Q>(&self, key: &Q, duration: Duration)
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let duration = crate::ticker::nanos(duration);
+        self.cache.set_variable_expiry(key, duration);
+    }
+
+    /// Inserts or replaces an entry with an explicit lifetime, returning the
+    /// previous value.
+    pub fn put(&self, key: K, value: V, duration: Duration) -> Option<V> {
+        let previous = self.cache.peek(&key);
+        self.cache.insert(key.clone(), value);
+        self.set_expires_after(&key, duration);
+        previous
+    }
+
+    /// Inserts only when absent, returning the existing value otherwise.
+    pub fn put_if_absent(&self, key: K, value: V, duration: Duration) -> Option<V> {
+        if self.cache.put_if_absent(key.clone(), value).is_some() {
+            return self.cache.peek(&key);
+        }
+        self.set_expires_after(&key, duration);
+        None
+    }
+
+    /// Entries with the earliest deadlines.
+    pub fn oldest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_expiry(true, limit)
+    }
+
+    /// Entries with the latest deadlines.
+    pub fn youngest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_expiry(false, limit)
+    }
+}
+
+/// The refresh-after-write policy view.
+pub struct FixedRefresh<'a, K, V> {
+    cache: &'a Cache<K, V>,
+}
+
+impl<K, V> FixedRefresh<'_, K, V>
+where
+    K: Hash + Eq + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
     /// Configured refresh interval.
-    pub fn refresh_after_write(&self) -> Option<Duration> {
+    pub fn refreshes_after(&self) -> Duration {
         self.cache
             .inner
             .config
-            .refresh_after_write
+            .refresh_ttl()
             .map(Duration::from_nanos)
+            .unwrap_or_default()
+    }
+
+    /// Changes the refresh interval for future staleness checks.
+    pub fn set_refreshes_after(&self, duration: Duration) {
+        self.cache
+            .inner
+            .config
+            .set_refresh_ttl(Some(crate::ticker::nanos(duration)));
+    }
+
+    /// Time since the entry was last written.
+    pub fn age_of<Q>(&self, key: &Q) -> Option<Duration>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.cache.age_of(key, false)
+    }
+
+    /// Entries written longest ago.
+    pub fn oldest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_time(false, true, limit)
+    }
+
+    /// Entries written most recently.
+    pub fn youngest(&self, limit: usize) -> Vec<(K, V)> {
+        self.cache.order_by_time(false, false, limit)
     }
 }
 

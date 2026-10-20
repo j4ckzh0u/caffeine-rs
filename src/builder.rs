@@ -1,6 +1,7 @@
 //! Fluent cache construction, mirroring Caffeine's `Caffeine` builder.
 
 use std::hash::Hash;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -242,7 +243,11 @@ where
             is_weighted: self.maximum_weight.is_some(),
             bounded,
             expiration,
-            refresh_after_write: self.refresh_after_write.map(nanos),
+            refresh_after_write: AtomicU64::new(
+                self.refresh_after_write
+                    .map(nanos)
+                    .unwrap_or(crate::config::NO_REFRESH),
+            ),
             record_stats: self.record_stats,
             ticker: self.ticker.unwrap_or_else(|| Arc::new(SystemTicker::new())),
             weigher: self.weigher,

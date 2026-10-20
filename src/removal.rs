@@ -13,14 +13,19 @@ pub enum RemovalCause {
     Expired,
     /// The entry was evicted by the size or weight policy.
     Size,
+    /// The entry's key or value was garbage-collected (weak/soft references).
+    Collected,
 }
 
 impl RemovalCause {
     /// Returns `true` for removals the cache performed on the caller's behalf
-    /// due to size, weight, or expiration. Manual removal and replacement are
-    /// not evictions.
+    /// due to size, weight, expiration, or reference collection. Manual
+    /// removal and replacement are not evictions.
     pub fn was_evicted(self) -> bool {
-        matches!(self, RemovalCause::Size | RemovalCause::Expired)
+        matches!(
+            self,
+            RemovalCause::Size | RemovalCause::Expired | RemovalCause::Collected
+        )
     }
 }
 

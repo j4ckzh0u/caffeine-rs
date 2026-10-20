@@ -43,3 +43,9 @@ pub(crate) fn nanos(duration: std::time::Duration) -> u64 {
 }
 
 pub(crate) type SharedTicker = Arc<dyn Ticker>;
+
+impl Ticker for SharedTicker {
+    fn read(&self) -> u64 {
+        (**self).read()
+    }
+}

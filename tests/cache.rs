@@ -570,8 +570,13 @@ fn policy_exposes_configuration() {
     let policy = cache.policy();
     assert_eq!(policy.maximum(), 42);
     assert!(!policy.is_weighted());
-    assert_eq!(policy.expire_after_access(), Some(Duration::from_secs(2)));
-    assert_eq!(policy.expire_after_write(), None);
+    assert_eq!(
+        policy
+            .expire_after_access()
+            .map(|expiration| expiration.expires_after()),
+        Some(Duration::from_secs(2))
+    );
+    assert!(policy.expire_after_write().is_none());
     assert_eq!(policy.estimated_size(), 0);
 }
 
@@ -643,7 +648,7 @@ fn variable_expiry_uses_per_entry_deadlines() {
     cache.insert(1, 2);
     cache.insert(2, 10);
     assert!(cache.policy().is_variable_expiration());
-    assert_eq!(cache.policy().expire_after_write(), None);
+    assert!(cache.policy().expire_after_write().is_none());
 
     ticker.advance(Duration::from_secs(3));
     assert_eq!(cache.get(&1), None);

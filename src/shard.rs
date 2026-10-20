@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::climber::WindowClimber;
-use crate::expiry::{Deadlines, Expiration, NEVER};
+use crate::expiry::{Deadlines, Expiration, MAXIMUM_EXPIRY, NEVER};
 use crate::frequency::FrequencySketch;
 use crate::removal::{RemovalCause, RemovedEntry};
 
@@ -81,6 +81,8 @@ struct Node<K, V> {
     weight: u32,
     region: Region,
     write_time: u64,
+    /// Last read or write, used by the expiration policy view.
+    access_time: u64,
     /// Effective deadline: the earlier of the access and write deadlines.
     expire_at: u64,
     /// Write deadline retained when both fixed TTLs are configured.
@@ -173,6 +175,297 @@ where
         self.window_max
     }
 
+    pub(crate) fn maximum(&self) -> u64 {
+        self.global_max_weight
+    }
+
+    pub(crate) fn weight_of<Q>(&self, key: &Q, now: u64) -> Option<u32>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let &id = self.index.get(key)?;
+        if self.is_expired(id, now) {
+            return None;
+        }
+        Some(self.node_weight(id) as u32)
+    }
+
+    pub(crate) fn age_of<Q>(&self, key: &Q, now: u64, access: bool) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let &id = self.index.get(key)?;
+        if self.is_expired(id, now) {
+            return None;
+        }
+        let node = self.nodes[id as usize].as_ref().expect("live node");
+        let timestamp = if access {
+            node.access_time
+        } else {
+            node.write_time
+        };
+        Some(now.saturating_sub(timestamp))
+    }
+
+    pub(crate) fn expires_at<Q>(&self, key: &Q, now: u64) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let &id = self.index.get(key)?;
+        if self.is_expired(id, now) {
+            return None;
+        }
+        let at = self.nodes[id as usize]
+            .as_ref()
+            .expect("live node")
+            .expire_at;
+        (at != NEVER).then_some(at)
+    }
+
+    pub(crate) fn refreshable_at<Q>(&self, key: &Q, now: u64, ttl: u64) -> Option<u64>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let &id = self.index.get(key)?;
+        if self.is_expired(id, now) {
+            return None;
+        }
+        let write_time = self.nodes[id as usize]
+            .as_ref()
+            .expect("live node")
+            .write_time;
+        Some(write_time.saturating_add(ttl))
+    }
+
+    /// Changes the maximum size or weight, including the window and protected
+    /// quotas, then eagerly evicts any excess.
+    pub(crate) fn set_maximum(&mut self, maximum: u64, removed: &mut Vec<RemovedEntry<K, V>>) {
+        if maximum == self.global_max_weight {
+            return;
+        }
+        self.global_max_weight = maximum;
+        self.capacity = maximum;
+        self.window_max = if maximum == 0 {
+            0
+        } else {
+            (maximum / 100).max(1).min(maximum)
+        };
+        let main = maximum.saturating_sub(self.window_max);
+        self.protected_max = ((main as u128 * 4) / 5) as u64;
+        self.climber.resized(maximum);
+        self.evict(removed);
+        self.climb();
+    }
+
+    /// Entries ordered from least to most likely to be retained.
+    pub(crate) fn coldest(&self, limit: usize) -> Vec<(K, V)> {
+        let mut primary = self.collect_region(Region::Window, false);
+        primary.extend(self.collect_region(Region::Probation, false));
+        primary.sort_by_key(|(_, _, frequency)| *frequency);
+        let mut out: Vec<(K, V)> = primary
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect();
+        out.extend(
+            self.collect_region(Region::Protected, false)
+                .into_iter()
+                .map(|(key, value, _)| (key, value)),
+        );
+        out.truncate(limit);
+        out
+    }
+
+    /// Entries ordered from most to least likely to be retained.
+    pub(crate) fn hottest(&self, limit: usize) -> Vec<(K, V)> {
+        let mut out: Vec<(K, V)> = self
+            .collect_region(Region::Protected, true)
+            .into_iter()
+            .map(|(key, value, _)| (key, value))
+            .collect();
+        let mut secondary = self.collect_region(Region::Window, true);
+        secondary.extend(self.collect_region(Region::Probation, true));
+        secondary.sort_by_key(|(_, _, frequency)| std::cmp::Reverse(*frequency));
+        out.extend(secondary.into_iter().map(|(key, value, _)| (key, value)));
+        out.truncate(limit);
+        out
+    }
+
+    /// Returns keys currently marked for an asynchronous refresh.
+    pub(crate) fn refreshing_keys(&self) -> Vec<K> {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.as_ref())
+            .filter(|node| node.refreshing)
+            .map(|node| node.key.clone())
+            .collect()
+    }
+
+    pub(crate) fn fixed_access(&self) -> Option<u64> {
+        self.expiration.fixed_access()
+    }
+
+    pub(crate) fn fixed_write(&self) -> Option<u64> {
+        self.expiration.fixed_write()
+    }
+
+    /// Replaces a fixed expiration duration and recomputes every entry's
+    /// deadline, matching Caffeine's `Policy.FixedExpiration`.
+    pub(crate) fn set_fixed_duration(
+        &mut self,
+        access: bool,
+        duration: u64,
+        now: u64,
+        removed: &mut Vec<RemovedEntry<K, V>>,
+    ) {
+        match &mut self.expiration {
+            Expiration::AfterAccess(current) if access => *current = duration,
+            Expiration::AfterWrite(current) if !access => *current = duration,
+            Expiration::Both {
+                write,
+                access: idle,
+            } => {
+                if access {
+                    *idle = duration;
+                } else {
+                    *write = duration;
+                }
+            }
+            _ => return,
+        }
+        let ids: Vec<u32> = self.index.values().copied().collect();
+        self.expiry_index.clear();
+        for id in ids {
+            let deadlines = {
+                let node = self.nodes[id as usize].as_ref().expect("live node");
+                self.fixed_deadlines(node.access_time, node.write_time)
+            };
+            if let Some(node) = self.nodes[id as usize].as_mut() {
+                node.expire_at = deadlines.at;
+                node.write_expire_at = deadlines.write_at;
+            }
+            self.schedule(id, deadlines.at);
+        }
+        self.expire_entries(now, removed);
+    }
+
+    /// Sets a variable deadline of `duration` from now for one entry.
+    pub(crate) fn set_expiry<Q>(
+        &mut self,
+        key: &Q,
+        now: u64,
+        duration: u64,
+        removed: &mut Vec<RemovedEntry<K, V>>,
+    ) where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let Some(&id) = self.index.get(key) else {
+            return;
+        };
+        let old = self.nodes[id as usize]
+            .as_ref()
+            .expect("live node")
+            .expire_at;
+        let at = now.saturating_add(duration).min(MAXIMUM_EXPIRY);
+        if let Some(node) = self.nodes[id as usize].as_mut() {
+            node.expire_at = at;
+            node.write_expire_at = NEVER;
+        }
+        self.reschedule(id, old, at);
+        self.expire_entries(now, removed);
+    }
+
+    /// Entries ordered by last access or last write time.
+    pub(crate) fn order_by_time(&self, access: bool, oldest: bool, limit: usize) -> Vec<(K, V)> {
+        let mut entries: Vec<(u64, K, V)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| node.as_ref())
+            .map(|node| {
+                let time = if access {
+                    node.access_time
+                } else {
+                    node.write_time
+                };
+                (time, node.key.clone(), node.value.clone())
+            })
+            .collect();
+        entries.sort_by_key(|(time, _, _)| *time);
+        if !oldest {
+            entries.reverse();
+        }
+        entries
+            .into_iter()
+            .take(limit)
+            .map(|(_, key, value)| (key, value))
+            .collect()
+    }
+
+    /// Entries ordered by their absolute expiration deadline.
+    pub(crate) fn order_by_expiry(&self, oldest: bool, limit: usize) -> Vec<(K, V)> {
+        let mut entries: Vec<(u64, K, V)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| node.as_ref())
+            .filter(|node| node.expire_at != NEVER)
+            .map(|node| (node.expire_at, node.key.clone(), node.value.clone()))
+            .collect();
+        entries.sort_by_key(|(at, _, _)| *at);
+        if !oldest {
+            entries.reverse();
+        }
+        entries
+            .into_iter()
+            .take(limit)
+            .map(|(_, key, value)| (key, value))
+            .collect()
+    }
+
+    fn fixed_deadlines(&self, access_time: u64, write_time: u64) -> Deadlines {
+        match &self.expiration {
+            Expiration::AfterWrite(duration) => {
+                let at = write_time.saturating_add(*duration).min(MAXIMUM_EXPIRY);
+                Deadlines { at, write_at: at }
+            }
+            Expiration::AfterAccess(duration) => Deadlines {
+                at: access_time.saturating_add(*duration).min(MAXIMUM_EXPIRY),
+                write_at: NEVER,
+            },
+            Expiration::Both { write, access } => {
+                let write_at = write_time.saturating_add(*write).min(MAXIMUM_EXPIRY);
+                let idle = access_time.saturating_add(*access).min(MAXIMUM_EXPIRY);
+                Deadlines {
+                    at: idle.min(write_at),
+                    write_at,
+                }
+            }
+            Expiration::None | Expiration::Custom(_) => Deadlines::NEVER,
+        }
+    }
+
+    fn collect_region(&self, region: Region, from_mru: bool) -> Vec<(K, V, u8)> {
+        let mut out = Vec::new();
+        let mut id = if from_mru {
+            self.list(region).head
+        } else {
+            self.list(region).tail
+        };
+        while id != NIL {
+            let node = self.nodes[id as usize].as_ref().expect("live node");
+            out.push((
+                node.key.clone(),
+                node.value.clone(),
+                self.sketch.frequency(node.hash),
+            ));
+            id = if from_mru { node.next } else { node.prev };
+        }
+        out
+    }
+
     pub(crate) fn get<Q>(
         &mut self,
         key: &Q,
@@ -224,6 +517,7 @@ where
         }
         if let Some(node) = self.nodes[id as usize].as_mut() {
             node.write_expire_at = new_deadlines.write_at;
+            node.access_time = now;
         }
         if weight != 0 {
             self.record_hit(region == Region::Window, region == Region::Probation);
@@ -313,6 +607,7 @@ where
                 node.hash = hash;
                 node.weight = weight;
                 node.write_time = now;
+                node.access_time = now;
                 node.expire_at = new_deadlines.at;
                 node.write_expire_at = new_deadlines.write_at;
                 node.refreshing = false;
@@ -362,6 +657,7 @@ where
             weight,
             region: Region::Window,
             write_time: now,
+            access_time: now,
             expire_at: deadlines.at,
             write_expire_at: deadlines.write_at,
             refreshing: false,
@@ -430,6 +726,7 @@ where
             node.value = value;
             node.weight = weight;
             node.write_time = now;
+            node.access_time = now;
             node.expire_at = new_deadlines.at;
             node.write_expire_at = new_deadlines.write_at;
             node.refreshing = false;

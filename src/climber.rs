@@ -55,6 +55,11 @@ impl WindowClimber {
         self.adjustment
     }
 
+    /// Rebuilds the tier when the cache is resized, dropping stale samples.
+    pub(crate) fn resized(&mut self, maximum: u64) {
+        *self = Self::new(maximum);
+    }
+
     pub(crate) fn carry_over(&mut self, remaining: i64) {
         self.adjustment = remaining;
     }
